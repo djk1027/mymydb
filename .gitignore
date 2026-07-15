@@ -1,0 +1,60 @@
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# VSCode
+.vscode/
+
+# IntelliJ
+.idea/
+*.iml
+
+# Build
+build/
+dist/
+target/
+
+# Log
+*.log
+
+# Temporary
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.*
+
+# Binary
+*.o
+*.a
+*.so
+*.dll
+*.exe
+
+# mymydb build outputs
+/mymydb
+/build/
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Java
+*.class
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Make
+*.d
+
+# Coverage
+coverage/
