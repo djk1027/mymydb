@@ -61,12 +61,22 @@ static bool exec_insert(Database *db, const InsertStmt *ins, FILE *out,
             return false;
         }
     }
-    table_append_row(t, cells);
+
+    /* Page storage copies the row in; we always own the transient cells. */
+    bool stored = table_append_row(t, cells);
+    for (int i = 0; i < t->ncols; i++) value_free(&cells[i]);
+    free(cells);
+
+    if (!stored) {
+        snprintf(errbuf, errcap, "row too large to fit in a %d-byte page",
+                 PAGE_SIZE);
+        return false;
+    }
     fprintf(out, "OK: 1 row inserted into '%s'\n", t->name);
     return true;
 }
 
-/* ---- WHERE evaluation --------------------------------------------------- */
+/* ---- value comparison / WHERE evaluation -------------------------------- */
 
 static int cmp_values(const Value *a, const Value *b) {
     if (a->type == TYPE_INT)
@@ -113,7 +123,7 @@ static bool eval_pred(const Expr *e, const Table *t, const Row *row) {
     return apply_cmp(op, cmp_values(cell, val));
 }
 
-/* ---- SELECT ------------------------------------------------------------- */
+/* ---- rendering ---------------------------------------------------------- */
 
 static char *value_to_str(const Value *v) {
     if (v->is_null) return strdup("NULL");
@@ -125,42 +135,20 @@ static char *value_to_str(const Value *v) {
     return strdup(v->as.s ? v->as.s : "");
 }
 
-static bool exec_select(Database *db, const SelectStmt *sel, FILE *out,
-                        char *errbuf, int errcap) {
-    Plan plan;
-    if (!optimizer_plan_select(db, sel, &plan, errbuf, errcap))
-        return false;
-
-    Table *t = plan.table;
-
-    /* collect indices of matching rows */
-    int *hits = malloc((t->nrows ? t->nrows : 1) * sizeof(int));
-    int nhits = 0;
-    for (int r = 0; r < t->nrows; r++)
-        if (eval_pred(plan.filter, t, &t->rows[r]))
-            hits[nhits++] = r;
-
-    /* render every cell to a string so we can align columns */
-    int ncol = plan.nproj;
+/*
+ * Print an aligned result grid. header has ncol entries; cells is nrows rows of
+ * ncol strings each. Ownership of the arrays stays with the caller.
+ */
+static void render(FILE *out, int ncol, char **header,
+                   int nrows, char ***cells) {
     int *width = calloc(ncol, sizeof(int));
-    char **header = malloc(ncol * sizeof(char *));
-    for (int c = 0; c < ncol; c++) {
-        header[c] = strdup(t->cols[plan.proj[c]].name);
-        width[c] = (int)strlen(header[c]);
-    }
-
-    char ***cells = malloc((nhits ? nhits : 1) * sizeof(char **));
-    for (int i = 0; i < nhits; i++) {
-        cells[i] = malloc(ncol * sizeof(char *));
-        Row *row = &t->rows[hits[i]];
+    for (int c = 0; c < ncol; c++) width[c] = (int)strlen(header[c]);
+    for (int i = 0; i < nrows; i++)
         for (int c = 0; c < ncol; c++) {
-            cells[i][c] = value_to_str(&row->cells[plan.proj[c]]);
             int w = (int)strlen(cells[i][c]);
             if (w > width[c]) width[c] = w;
         }
-    }
 
-    /* header */
     for (int c = 0; c < ncol; c++)
         fprintf(out, "%s%-*s", c ? " | " : "", width[c], header[c]);
     fprintf(out, "\n");
@@ -170,24 +158,240 @@ static bool exec_select(Database *db, const SelectStmt *sel, FILE *out,
     }
     fprintf(out, "\n");
 
-    /* rows */
-    for (int i = 0; i < nhits; i++) {
+    for (int i = 0; i < nrows; i++) {
         for (int c = 0; c < ncol; c++)
             fprintf(out, "%s%-*s", c ? " | " : "", width[c], cells[i][c]);
         fprintf(out, "\n");
     }
-    fprintf(out, "(%d row%s)\n", nhits, nhits == 1 ? "" : "s");
+    fprintf(out, "(%d row%s)\n", nrows, nrows == 1 ? "" : "s");
+    free(width);
+}
 
-    /* cleanup */
-    for (int i = 0; i < nhits; i++) {
+/* ---- SELECT: row path (projection + ORDER BY) --------------------------- */
+
+/* qsort comparator context (single-threaded, so a file-static is fine). */
+static const Plan *g_sort_plan;
+
+static int row_cmp(const void *pa, const void *pb) {
+    const Row *a = pa, *b = pb;
+    for (int k = 0; k < g_sort_plan->norder; k++) {
+        int idx = g_sort_plan->order_col[k];
+        const Value *va = &a->cells[idx];
+        const Value *vb = &b->cells[idx];
+        int c;
+        if (va->is_null || vb->is_null)
+            c = (va->is_null ? 0 : 1) - (vb->is_null ? 0 : 1); /* NULLs first */
+        else
+            c = cmp_values(va, vb);
+        if (c) return g_sort_plan->order_desc[k] ? -c : c;
+    }
+    return 0;
+}
+
+/* Collects every row passing the filter as an owned materialized-row vector. */
+static Row *scan_rows(const Plan *plan, const Table *t, int *out_n) {
+    int ncols = t->ncols;
+    Row *rows = NULL;
+    int n = 0, cap = 0;
+
+    Value *scratch = malloc(ncols * sizeof(Value));
+    TableCursor cur;
+    table_cursor_init(&cur, t);
+    while (table_cursor_next(&cur, scratch)) {
+        Row tmp = {scratch};
+        if (eval_pred(plan->filter, t, &tmp)) {
+            if (n == cap) {
+                cap = cap ? cap * 2 : 16;
+                rows = realloc(rows, cap * sizeof(Row));
+            }
+            rows[n++].cells = scratch;             /* keep this buffer */
+            scratch = malloc(ncols * sizeof(Value)); /* fresh one for next row */
+        } else {
+            for (int c = 0; c < ncols; c++) value_free(&scratch[c]);
+        }
+    }
+    free(scratch); /* last (unused / already-freed) buffer */
+
+    *out_n = n;
+    return rows;
+}
+
+static void free_rows(Row *rows, int n, int ncols) {
+    for (int i = 0; i < n; i++) {
+        for (int c = 0; c < ncols; c++) value_free(&rows[i].cells[c]);
+        free(rows[i].cells);
+    }
+    free(rows);
+}
+
+static void run_rows(const Plan *plan, const Table *t, FILE *out) {
+    int nrows;
+    Row *rows = scan_rows(plan, t, &nrows);
+
+    if (plan->norder > 0) {
+        g_sort_plan = plan;
+        qsort(rows, nrows, sizeof(Row), row_cmp);
+    }
+
+    int ncol = plan->nproj;
+    char **header = malloc(ncol * sizeof(char *));
+    for (int c = 0; c < ncol; c++)
+        header[c] = strdup(t->cols[plan->proj[c]].name);
+
+    char ***cells = malloc((nrows ? nrows : 1) * sizeof(char **));
+    for (int i = 0; i < nrows; i++) {
+        cells[i] = malloc(ncol * sizeof(char *));
+        for (int c = 0; c < ncol; c++)
+            cells[i][c] = value_to_str(&rows[i].cells[plan->proj[c]]);
+    }
+
+    render(out, ncol, header, nrows, cells);
+
+    for (int i = 0; i < nrows; i++) {
         for (int c = 0; c < ncol; c++) free(cells[i][c]);
         free(cells[i]);
     }
     free(cells);
     for (int c = 0; c < ncol; c++) free(header[c]);
     free(header);
-    free(width);
-    free(hits);
+    free_rows(rows, nrows, t->ncols);
+}
+
+/* ---- SELECT: aggregate path --------------------------------------------- */
+
+typedef struct {
+    int64_t count;  /* COUNT result, and SUM/AVG denominator (non-null count) */
+    int64_t isum;   /* SUM accumulator */
+    double  dsum;   /* AVG accumulator */
+    Value   best;   /* MIN/MAX accumulator (owned when seen) */
+    bool    seen;   /* whether best holds a value */
+} AggAcc;
+
+static const char *agg_name(AggFunc f) {
+    switch (f) {
+        case AGG_COUNT: return "COUNT";
+        case AGG_SUM:   return "SUM";
+        case AGG_AVG:   return "AVG";
+        case AGG_MIN:   return "MIN";
+        case AGG_MAX:   return "MAX";
+    }
+    return "?";
+}
+
+static void agg_fold(const Plan *plan, int i, AggAcc *acc, const Value *cells) {
+    const AggCall *a = &plan->aggs[i];
+
+    if (a->func == AGG_COUNT) {
+        if (a->star || !cells[plan->agg_col[i]].is_null) acc->count++;
+        return;
+    }
+
+    const Value *v = &cells[plan->agg_col[i]];
+    if (v->is_null) return;
+
+    switch (a->func) {
+        case AGG_SUM:
+            acc->isum += v->as.i;
+            acc->count++;
+            break;
+        case AGG_AVG:
+            acc->dsum += (double)v->as.i;
+            acc->count++;
+            break;
+        case AGG_MIN:
+            if (!acc->seen || cmp_values(v, &acc->best) < 0) {
+                value_free(&acc->best);
+                acc->best = value_copy(v);
+                acc->seen = true;
+            }
+            break;
+        case AGG_MAX:
+            if (!acc->seen || cmp_values(v, &acc->best) > 0) {
+                value_free(&acc->best);
+                acc->best = value_copy(v);
+                acc->seen = true;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+static char *agg_result_str(const Plan *plan, int i, const AggAcc *acc) {
+    const AggCall *a = &plan->aggs[i];
+    char buf[64];
+    switch (a->func) {
+        case AGG_COUNT:
+            snprintf(buf, sizeof buf, "%" PRId64, acc->count);
+            return strdup(buf);
+        case AGG_SUM:
+            if (acc->count == 0) return strdup("NULL");
+            snprintf(buf, sizeof buf, "%" PRId64, acc->isum);
+            return strdup(buf);
+        case AGG_AVG:
+            if (acc->count == 0) return strdup("NULL");
+            snprintf(buf, sizeof buf, "%.6g", acc->dsum / (double)acc->count);
+            return strdup(buf);
+        case AGG_MIN:
+        case AGG_MAX:
+            if (!acc->seen) return strdup("NULL");
+            return value_to_str(&acc->best);
+    }
+    return strdup("NULL");
+}
+
+static void run_aggregate(const Plan *plan, const Table *t, FILE *out) {
+    int n = plan->naggs;
+    AggAcc *acc = calloc(n, sizeof(AggAcc));
+
+    Value *scratch = malloc(t->ncols * sizeof(Value));
+    TableCursor cur;
+    table_cursor_init(&cur, t);
+    while (table_cursor_next(&cur, scratch)) {
+        Row tmp = {scratch};
+        if (eval_pred(plan->filter, t, &tmp))
+            for (int i = 0; i < n; i++)
+                agg_fold(plan, i, &acc[i], scratch);
+        for (int c = 0; c < t->ncols; c++) value_free(&scratch[c]);
+    }
+    free(scratch);
+
+    char **header = malloc(n * sizeof(char *));
+    char ***cells = malloc(sizeof(char **));
+    cells[0] = malloc(n * sizeof(char *));
+    for (int i = 0; i < n; i++) {
+        const AggCall *a = &plan->aggs[i];
+        char hbuf[MAX_NAME + 16];
+        snprintf(hbuf, sizeof hbuf, "%s(%s)", agg_name(a->func),
+                 a->star ? "*" : a->column);
+        header[i] = strdup(hbuf);
+        cells[0][i] = agg_result_str(plan, i, &acc[i]);
+    }
+
+    render(out, n, header, 1, cells);
+
+    for (int i = 0; i < n; i++) {
+        free(header[i]);
+        free(cells[0][i]);
+        value_free(&acc[i].best);
+    }
+    free(cells[0]);
+    free(cells);
+    free(header);
+    free(acc);
+}
+
+static bool exec_select(Database *db, const SelectStmt *sel, FILE *out,
+                        char *errbuf, int errcap) {
+    Plan plan;
+    if (!optimizer_plan_select(db, sel, &plan, errbuf, errcap))
+        return false;
+
+    if (plan.is_agg)
+        run_aggregate(&plan, plan.table, out);
+    else
+        run_rows(&plan, plan.table, out);
+
     plan_free(&plan);
     return true;
 }

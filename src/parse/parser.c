@@ -269,33 +269,112 @@ static Stmt *parse_insert(Parser *p) {
     return s;
 }
 
+static bool agg_func_from(const char *name, AggFunc *out) {
+    if (strcasecmp(name, "COUNT") == 0) { *out = AGG_COUNT; return true; }
+    if (strcasecmp(name, "SUM") == 0)   { *out = AGG_SUM;   return true; }
+    if (strcasecmp(name, "AVG") == 0)   { *out = AGG_AVG;   return true; }
+    if (strcasecmp(name, "MIN") == 0)   { *out = AGG_MIN;   return true; }
+    if (strcasecmp(name, "MAX") == 0)   { *out = AGG_MAX;   return true; }
+    return false;
+}
+
+/* Parses the select list: either "*", plain columns, or aggregate calls.
+ * Mixing plain columns and aggregates is rejected. */
+static void parse_select_list(Parser *p, SelectStmt *sel) {
+    if (accept(p, TOK_STAR)) {
+        sel->select_all = true;
+        return;
+    }
+
+    int ccap = 4, ncols = 0;
+    char **cols = arena_alloc(p->arena, ccap * sizeof(char *));
+    int acap = 4, naggs = 0;
+    AggCall *aggs = arena_alloc(p->arena, acap * sizeof(AggCall));
+
+    do {
+        if (p->cur.type != TOK_IDENT)
+            fail(p, "expected column or function near '%.*s'",
+                 p->cur.len ? p->cur.len : 1, p->cur.len ? p->cur.start : "");
+        char *name = arena_strndup(p->arena, p->cur.start, p->cur.len);
+        advance(p);
+
+        if (accept(p, TOK_LPAREN)) {
+            AggFunc func;
+            if (!agg_func_from(name, &func))
+                fail(p, "unknown function '%s'", name);
+            AggCall call = {.func = func};
+            if (accept(p, TOK_STAR))
+                call.star = true;
+            else
+                call.column = dup_ident(p, "column name");
+            expect(p, TOK_RPAREN, "')'");
+
+            if (naggs == acap) {
+                int newcap = acap * 2;
+                aggs = arena_realloc(p->arena, aggs, acap * sizeof(AggCall),
+                                     newcap * sizeof(AggCall));
+                acap = newcap;
+            }
+            aggs[naggs++] = call;
+        } else {
+            if (ncols == ccap) {
+                int newcap = ccap * 2;
+                cols = arena_realloc(p->arena, cols, ccap * sizeof(char *),
+                                     newcap * sizeof(char *));
+                ccap = newcap;
+            }
+            cols[ncols++] = name;
+        }
+    } while (accept(p, TOK_COMMA));
+
+    if (naggs > 0 && ncols > 0)
+        fail(p, "cannot mix aggregate functions with plain columns");
+
+    if (naggs > 0) {
+        sel->is_agg = true;
+        sel->aggs = aggs;
+        sel->naggs = naggs;
+    } else {
+        sel->cols = cols;
+        sel->ncols = ncols;
+    }
+}
+
+static void parse_order_by(Parser *p, SelectStmt *sel) {
+    expect_kw(p, "BY");
+    int cap = 4, n = 0;
+    OrderKey *keys = arena_alloc(p->arena, cap * sizeof(OrderKey));
+    do {
+        if (n == cap) {
+            int newcap = cap * 2;
+            keys = arena_realloc(p->arena, keys, cap * sizeof(OrderKey),
+                                 newcap * sizeof(OrderKey));
+            cap = newcap;
+        }
+        OrderKey k = {.desc = false};
+        k.column = dup_ident(p, "column name");
+        if (accept_kw(p, "DESC")) k.desc = true;
+        else (void)accept_kw(p, "ASC");
+        keys[n++] = k;
+    } while (accept(p, TOK_COMMA));
+    sel->order = keys;
+    sel->norder = n;
+}
+
 static Stmt *parse_select(Parser *p) {
     Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
     s->type = STMT_SELECT;
 
-    if (accept(p, TOK_STAR)) {
-        s->as.select.select_all = true;
-    } else {
-        int cap = 4, n = 0;
-        char **cols = arena_alloc(p->arena, cap * sizeof(char *));
-        do {
-            if (n == cap) {
-                int newcap = cap * 2;
-                cols = arena_realloc(p->arena, cols, cap * sizeof(char *),
-                                     newcap * sizeof(char *));
-                cap = newcap;
-            }
-            cols[n++] = dup_ident(p, "column name");
-        } while (accept(p, TOK_COMMA));
-        s->as.select.cols = cols;
-        s->as.select.ncols = n;
-    }
+    parse_select_list(p, &s->as.select);
 
     expect_kw(p, "FROM");
     take_ident(p, s->as.select.table, MAX_NAME, "table name");
 
     if (accept_kw(p, "WHERE"))
         s->as.select.where = parse_or(p);
+
+    if (accept_kw(p, "ORDER"))
+        parse_order_by(p, &s->as.select);
 
     return s;
 }

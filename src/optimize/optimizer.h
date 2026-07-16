@@ -20,6 +20,18 @@ typedef struct {
     /* Projection: resolved column indices into the table, or NULL for SELECT *. */
     int *proj;
     int nproj;
+
+    /* Aggregates: borrowed from the Stmt; agg_col[i] is the resolved column
+     * index (or -1 for COUNT(*)). Valid when is_agg. */
+    bool is_agg;
+    const AggCall *aggs;
+    int naggs;
+    int *agg_col;
+
+    /* ORDER BY: resolved column indices and directions (both length norder). */
+    int *order_col;
+    bool *order_desc;
+    int norder;
 } Plan;
 
 /*

@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* Verify every column referenced in the WHERE tree exists in the table. */
 static bool check_expr_cols(const Table *t, const Expr *e,
@@ -35,13 +36,40 @@ bool optimizer_plan_select(Database *db, const SelectStmt *sel,
     if (!check_expr_cols(t, sel->where, errbuf, errcap))
         return false;
 
+    memset(out, 0, sizeof(*out));
     out->kind = PLAN_FULL_SCAN; /* v0: always a full scan */
     out->table = t;
     out->filter = sel->where;
-    out->proj = NULL;
-    out->nproj = 0;
 
-    if (sel->select_all) {
+    /* Resolve aggregates or projection. */
+    if (sel->is_agg) {
+        out->is_agg = true;
+        out->aggs = sel->aggs;
+        out->naggs = sel->naggs;
+        out->agg_col = malloc(sel->naggs * sizeof(int));
+        for (int i = 0; i < sel->naggs; i++) {
+            const AggCall *a = &sel->aggs[i];
+            if (a->star) {                 /* COUNT(*) */
+                out->agg_col[i] = -1;
+                continue;
+            }
+            int idx = table_col_index(t, a->column);
+            if (idx < 0) {
+                snprintf(errbuf, errcap, "unknown column '%s'", a->column);
+                plan_free(out);
+                return false;
+            }
+            if ((a->func == AGG_SUM || a->func == AGG_AVG) &&
+                t->cols[idx].type != TYPE_INT) {
+                snprintf(errbuf, errcap,
+                         "SUM/AVG requires an INT column, but '%s' is %s",
+                         a->column, coltype_name(t->cols[idx].type));
+                plan_free(out);
+                return false;
+            }
+            out->agg_col[i] = idx;
+        }
+    } else if (sel->select_all) {
         out->nproj = t->ncols;
         out->proj = malloc(t->ncols * sizeof(int));
         for (int i = 0; i < t->ncols; i++) out->proj[i] = i;
@@ -52,18 +80,42 @@ bool optimizer_plan_select(Database *db, const SelectStmt *sel,
             int idx = table_col_index(t, sel->cols[i]);
             if (idx < 0) {
                 snprintf(errbuf, errcap, "unknown column '%s'", sel->cols[i]);
-                free(out->proj);
-                out->proj = NULL;
+                plan_free(out);
                 return false;
             }
             out->proj[i] = idx;
         }
     }
+
+    /* Resolve ORDER BY keys against the table's columns. */
+    if (sel->norder > 0) {
+        out->norder = sel->norder;
+        out->order_col = malloc(sel->norder * sizeof(int));
+        out->order_desc = malloc(sel->norder * sizeof(bool));
+        for (int i = 0; i < sel->norder; i++) {
+            int idx = table_col_index(t, sel->order[i].column);
+            if (idx < 0) {
+                snprintf(errbuf, errcap, "unknown column '%s' in ORDER BY",
+                         sel->order[i].column);
+                plan_free(out);
+                return false;
+            }
+            out->order_col[i] = idx;
+            out->order_desc[i] = sel->order[i].desc;
+        }
+    }
+
     return true;
 }
 
 void plan_free(Plan *plan) {
     if (!plan) return;
     free(plan->proj);
+    free(plan->agg_col);
+    free(plan->order_col);
+    free(plan->order_desc);
     plan->proj = NULL;
+    plan->agg_col = NULL;
+    plan->order_col = NULL;
+    plan->order_desc = NULL;
 }

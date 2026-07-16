@@ -15,6 +15,15 @@ Value value_text(const char *s) {
     return out;
 }
 
+Value value_text_n(const char *s, size_t n) {
+    Value out = {.type = TYPE_TEXT, .is_null = false};
+    char *buf = malloc(n + 1);
+    if (s && n) memcpy(buf, s, n);
+    buf[n] = '\0';
+    out.as.s = buf;
+    return out;
+}
+
 Value value_null(ColType type) {
     Value out = {.type = type, .is_null = true};
     if (type == TYPE_TEXT) out.as.s = NULL;

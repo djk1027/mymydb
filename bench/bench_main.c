@@ -72,6 +72,11 @@ int main(int argc, char **argv) {
         "SELECT id FROM b WHERE id >= 0", perr, sizeof perr);
     Stmt *scan_few = parse_statement(
         "SELECT id, label FROM b WHERE label = 'row42'", perr, sizeof perr);
+    Stmt *agg_all = parse_statement(
+        "SELECT COUNT(*), SUM(id), AVG(id), MIN(id), MAX(id) FROM b",
+        perr, sizeof perr);
+    Stmt *order_all = parse_statement(
+        "SELECT id FROM b ORDER BY id DESC", perr, sizeof perr);
 
     const int REPEAT = 5;
     char eerr[256];
@@ -100,9 +105,27 @@ int main(int argc, char **argv) {
         report("full scan (WHERE, 1 hit)", (long)n * REPEAT, now_sec() - t0);
     }
 
+    /* --- 5. Aggregate over every row (COUNT/SUM/AVG/MIN/MAX) --- */
+    {
+        double t0 = now_sec();
+        for (int r = 0; r < REPEAT; r++)
+            execute(db, agg_all, sink, eerr, sizeof eerr);
+        report("aggregate (5 funcs)", (long)n * REPEAT, now_sec() - t0);
+    }
+
+    /* --- 6. ORDER BY over every row (full sort) --- */
+    {
+        double t0 = now_sec();
+        for (int r = 0; r < REPEAT; r++)
+            execute(db, order_all, sink, eerr, sizeof eerr);
+        report("order by (full sort)", (long)n * REPEAT, now_sec() - t0);
+    }
+
     stmt_free(scan_all);
     stmt_free(scan_hit);
     stmt_free(scan_few);
+    stmt_free(agg_all);
+    stmt_free(order_all);
     db_free(db);
     fclose(sink);
     return 0;
