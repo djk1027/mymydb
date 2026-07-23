@@ -210,6 +210,13 @@ static ColType parse_coltype(Parser *p) {
 }
 
 static Stmt *parse_create(Parser *p) {
+    if (accept_kw(p, "DATABASE")) {
+        Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
+        s->type = STMT_CREATE_DATABASE;
+        take_ident(p, s->as.db.name, MAX_NAME, "database name");
+        return s;
+    }
+
     expect_kw(p, "TABLE");
 
     Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
@@ -379,6 +386,74 @@ static Stmt *parse_select(Parser *p) {
     return s;
 }
 
+static Stmt *parse_delete(Parser *p) {
+    expect_kw(p, "FROM");
+
+    Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
+    s->type = STMT_DELETE;
+    take_ident(p, s->as.del.table, MAX_NAME, "table name");
+
+    if (accept_kw(p, "WHERE"))
+        s->as.del.where = parse_or(p);
+
+    return s;
+}
+
+static Stmt *parse_use(Parser *p) {
+    Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
+    s->type = STMT_USE;
+    take_ident(p, s->as.db.name, MAX_NAME, "database name");
+    return s;
+}
+
+static Stmt *parse_show(Parser *p) {
+    Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
+    s->type = STMT_SHOW;
+    if (accept_kw(p, "DATABASES")) {
+        s->as.show.kind = SHOW_DATABASES;
+    } else if (accept_kw(p, "TABLES")) {
+        s->as.show.kind = SHOW_TABLES;
+    } else if (accept_kw(p, "PARAMETERS")) {
+        s->as.show.kind = SHOW_PARAMETERS;
+    } else if (accept_kw(p, "GLOBAL")) {
+        expect_kw(p, "PARAMETERS");
+        s->as.show.kind = SHOW_GLOBAL_PARAMETERS;
+    } else if (accept_kw(p, "CREATE")) {
+        expect_kw(p, "TABLE");
+        s->as.show.kind = SHOW_CREATE_TABLE;
+        take_ident(p, s->as.show.name, MAX_NAME, "table name");
+    } else {
+        fail(p, "expected DATABASES|TABLES|PARAMETERS|CREATE TABLE after SHOW "
+                "near '%.*s'",
+             p->cur.len ? p->cur.len : 1, p->cur.len ? p->cur.start : "");
+    }
+    return s;
+}
+
+static Stmt *parse_set(Parser *p) {
+    Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
+    s->type = STMT_SET;
+    if (accept_kw(p, "GLOBAL")) s->as.set.global = true;
+    take_ident(p, s->as.set.name, MAX_NAME, "parameter name");
+    expect(p, TOK_EQ, "'='");
+
+    Value v = parse_literal(p);
+    if (v.type == TYPE_INT) {
+        char buf[32];
+        snprintf(buf, sizeof buf, "%lld", (long long)v.as.i);
+        s->as.set.value = arena_strndup(p->arena, buf, strlen(buf));
+    } else {
+        s->as.set.value = v.as.s; /* arena-owned string from parse_literal */
+    }
+    return s;
+}
+
+static Stmt *parse_bare(Parser *p, StmtType type) {
+    Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
+    s->type = type;
+    return s;
+}
+
 /* ---- entry point -------------------------------------------------------- */
 
 Stmt *parse_statement(const char *sql, char *errbuf, int errcap) {
@@ -401,6 +476,13 @@ Stmt *parse_statement(const char *sql, char *errbuf, int errcap) {
     if (accept_kw(&p, "CREATE"))      s = parse_create(&p);
     else if (accept_kw(&p, "INSERT")) s = parse_insert(&p);
     else if (accept_kw(&p, "SELECT")) s = parse_select(&p);
+    else if (accept_kw(&p, "DELETE")) s = parse_delete(&p);
+    else if (accept_kw(&p, "USE"))    s = parse_use(&p);
+    else if (accept_kw(&p, "SHOW"))   s = parse_show(&p);
+    else if (accept_kw(&p, "SET"))    s = parse_set(&p);
+    else if (accept_kw(&p, "HELP"))   s = parse_bare(&p, STMT_HELP);
+    else if (accept_kw(&p, "EXIT") ||
+             accept_kw(&p, "QUIT"))   s = parse_bare(&p, STMT_EXIT);
     else { fail(&p, "unknown statement near '%.*s'",
                 p.cur.len ? p.cur.len : 1, p.cur.len ? p.cur.start : "");
            return NULL; /* unreachable; silences -Wmaybe-uninitialized */ }

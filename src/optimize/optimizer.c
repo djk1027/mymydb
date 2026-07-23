@@ -25,6 +25,11 @@ static bool check_expr_cols(const Table *t, const Expr *e,
     return true;
 }
 
+bool optimizer_check_where(const Table *t, const Expr *where,
+                           char *errbuf, int errcap) {
+    return check_expr_cols(t, where, errbuf, errcap);
+}
+
 bool optimizer_plan_select(Database *db, const SelectStmt *sel,
                            Plan *out, char *errbuf, int errcap) {
     Table *t = db_find_table(db, sel->table);

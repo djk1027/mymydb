@@ -60,7 +60,33 @@ typedef enum {
     STMT_CREATE,
     STMT_INSERT,
     STMT_SELECT,
+    STMT_DELETE,
+    STMT_CREATE_DATABASE,
+    STMT_USE,
+    STMT_SHOW,    /* SHOW DATABASES|TABLES|PARAMETERS|GLOBAL PARAMETERS|CREATE TABLE t */
+    STMT_SET,     /* SET [GLOBAL] name = value */
+    STMT_HELP,    /* HELP */
+    STMT_EXIT,    /* EXIT / QUIT (handled by the REPL) */
 } StmtType;
+
+typedef enum {
+    SHOW_DATABASES,
+    SHOW_TABLES,
+    SHOW_PARAMETERS,
+    SHOW_GLOBAL_PARAMETERS,
+    SHOW_CREATE_TABLE,
+} ShowKind;
+
+typedef struct {
+    ShowKind kind;
+    char name[MAX_NAME];   /* table name for SHOW CREATE TABLE */
+} ShowStmt;
+
+typedef struct {
+    bool global;           /* SET GLOBAL vs SET */
+    char name[MAX_NAME];
+    char *value;           /* arena-owned string form of the value */
+} SetStmt;
 
 typedef struct {
     char table[MAX_NAME];
@@ -91,12 +117,26 @@ typedef struct {
 } SelectStmt;
 
 typedef struct {
+    char table[MAX_NAME];
+    Expr *where;          /* nullable: DELETE FROM t with no WHERE clears all */
+} DeleteStmt;
+
+/* CREATE DATABASE <name> / USE <name> */
+typedef struct {
+    char name[MAX_NAME];
+} DbStmt;
+
+typedef struct {
     StmtType type;
     Arena *arena;   /* backing storage for this statement's whole AST */
     union {
         CreateStmt create;
         InsertStmt insert;
         SelectStmt select;
+        DeleteStmt del;
+        DbStmt db;
+        ShowStmt show;
+        SetStmt set;
     } as;
 } Stmt;
 

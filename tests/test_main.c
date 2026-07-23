@@ -7,7 +7,7 @@ TestStats T = {0};
 /* ---- basics ------------------------------------------------------------- */
 
 static void test_create_insert_select(void) {
-    Database *db = db_new();
+    Instance *db = db_new();
     char err[256];
     char *out = NULL;
 
@@ -25,7 +25,7 @@ static void test_create_insert_select(void) {
 }
 
 static void test_projection(void) {
-    Database *db = db_new();
+    Instance *db = db_new();
     char err[256];
     char *out = NULL;
 
@@ -46,7 +46,7 @@ static void test_projection(void) {
 /* ---- WHERE -------------------------------------------------------------- */
 
 static void test_where_operators(void) {
-    Database *db = db_new();
+    Instance *db = db_new();
     char err[256];
     char *out = NULL;
 
@@ -84,7 +84,7 @@ static void test_where_operators(void) {
 /* ---- aggregates (v1.2) -------------------------------------------------- */
 
 static void test_aggregates(void) {
-    Database *db = db_new();
+    Instance *db = db_new();
     char err[256];
     char *out = NULL;
 
@@ -142,7 +142,7 @@ static void test_aggregates(void) {
 /* ---- ORDER BY (v1.2) ---------------------------------------------------- */
 
 static void test_order_by(void) {
-    Database *db = db_new();
+    Instance *db = db_new();
     char err[256];
     char *out = NULL;
 
@@ -190,16 +190,16 @@ static void test_order_by(void) {
     db_free(db);
 }
 
-/* ---- pages: rows survive a serialize/deserialize round-trip ------------- */
+/* ---- blocks/extents: rows survive a serialize/deserialize round-trip ---- */
 
-static void test_pages(void) {
-    Database *db = db_new();
+static void test_blocks(void) {
+    Instance *db = db_new();
     char err[256];
     char *out = NULL;
 
     db_exec(db, "CREATE TABLE pg (id INT, s TEXT)", NULL, err, sizeof err);
 
-    /* Enough rows to span many 4KB pages, mixing short and long text. */
+    /* Enough rows to span many 8KB blocks (and several doubling extents). */
     const int N = 5000;
     bool ok = true;
     for (int i = 0; i < N; i++) {
@@ -214,21 +214,21 @@ static void test_pages(void) {
     CHECK(contains(out, "5000"));
     free(out);
 
-    /* exact text round-trips out of the page */
+    /* exact text round-trips out of the block */
     CHECK(db_exec(db, "SELECT s FROM pg WHERE id = 4999", &out, err, sizeof err));
     CHECK(contains(out, "value-4999-padding-padding"));
     CHECK(contains(out, "(1 row)"));
     free(out);
 
-    /* a row larger than one page is rejected, not truncated */
+    /* a row larger than one 8KB block is rejected, not truncated */
     {
-        char *big = malloc(6000);
-        memset(big, 'x', 5999);
-        big[5999] = '\0';
-        char *sql = malloc(6100);
-        snprintf(sql, 6100, "INSERT INTO pg VALUES (1, '%s')", big);
+        char *big = malloc(9000);
+        memset(big, 'x', 8999);
+        big[8999] = '\0';
+        char *sql = malloc(9100);
+        snprintf(sql, 9100, "INSERT INTO pg VALUES (1, '%s')", big);
         CHECK(!db_exec(db, sql, NULL, err, sizeof err));
-        CHECK(contains(err, "page"));
+        CHECK(contains(err, "block"));
         free(sql);
         free(big);
     }
@@ -236,10 +236,275 @@ static void test_pages(void) {
     db_free(db);
 }
 
+/* ---- DELETE (v2.0) ------------------------------------------------------ */
+
+static void test_delete(void) {
+    Instance *db = db_new();
+    char err[256];
+    char *out = NULL;
+
+    db_exec(db, "CREATE TABLE d (id INT, s TEXT)", NULL, err, sizeof err);
+    for (int i = 1; i <= 5; i++) {
+        char sql[64];
+        snprintf(sql, sizeof sql, "INSERT INTO d VALUES (%d, 'r')", i);
+        db_exec(db, sql, NULL, err, sizeof err);
+    }
+
+    /* delete a single row via WHERE */
+    CHECK(db_exec(db, "DELETE FROM d WHERE id = 3", &out, err, sizeof err));
+    CHECK(contains(out, "1 row deleted"));
+    free(out);
+
+    CHECK(db_exec(db, "SELECT COUNT(*) FROM d", &out, err, sizeof err));
+    CHECK(contains(out, "4"));
+    free(out);
+
+    /* the deleted row is really gone; remaining rows intact */
+    CHECK(db_exec(db, "SELECT id FROM d ORDER BY id", &out, err, sizeof err));
+    CHECK(!contains(out, "3"));
+    CHECK(contains(out, "1"));
+    CHECK(contains(out, "5"));
+    free(out);
+
+    /* a row can still be inserted after deletions */
+    CHECK(db_exec(db, "INSERT INTO d VALUES (6, 'r')", NULL, err, sizeof err));
+    CHECK(db_exec(db, "SELECT COUNT(*) FROM d", &out, err, sizeof err));
+    CHECK(contains(out, "5"));
+    free(out);
+
+    /* range delete: ids 4, 5, 6 (3 was already gone) */
+    CHECK(db_exec(db, "DELETE FROM d WHERE id >= 4", &out, err, sizeof err));
+    CHECK(contains(out, "3 rows deleted"));
+    free(out);
+
+    /* DELETE with no WHERE clears everything */
+    CHECK(db_exec(db, "DELETE FROM d", &out, err, sizeof err));
+    free(out);
+    CHECK(db_exec(db, "SELECT COUNT(*) FROM d", &out, err, sizeof err));
+    CHECK(contains(out, "0"));
+    free(out);
+
+    /* errors: unknown table / unknown WHERE column */
+    CHECK(!db_exec(db, "DELETE FROM nope", NULL, err, sizeof err));
+    CHECK(contains(err, "no such table"));
+    CHECK(!db_exec(db, "DELETE FROM d WHERE zzz = 1", NULL, err, sizeof err));
+
+    db_free(db);
+}
+
+/* ---- multiple databases (v2.0) ------------------------------------------ */
+
+static void test_databases(void) {
+    Instance *db = db_new();
+    char err[256];
+    char *out = NULL;
+
+    /* a fresh instance starts in the default 'main' database */
+    CHECK(db_exec(db, "CREATE TABLE t (a INT)", NULL, err, sizeof err));
+    CHECK(db_exec(db, "INSERT INTO t VALUES (1)", NULL, err, sizeof err));
+
+    /* a second database is isolated: its own tables */
+    CHECK(db_exec(db, "CREATE DATABASE other", NULL, err, sizeof err));
+    CHECK(db_exec(db, "USE other", NULL, err, sizeof err));
+    CHECK(!db_exec(db, "SELECT * FROM t", NULL, err, sizeof err)); /* not visible here */
+    CHECK(contains(err, "no such table"));
+    CHECK(db_exec(db, "CREATE TABLE t (b TEXT)", NULL, err, sizeof err));
+    CHECK(db_exec(db, "INSERT INTO t VALUES ('x')", NULL, err, sizeof err));
+
+    /* switching back sees the original table */
+    CHECK(db_exec(db, "USE main", NULL, err, sizeof err));
+    CHECK(db_exec(db, "SELECT * FROM t", &out, err, sizeof err));
+    CHECK(contains(out, "(1 row)"));
+    CHECK(contains(out, "a"));
+    free(out);
+
+    /* errors: duplicate database / unknown database */
+    CHECK(!db_exec(db, "CREATE DATABASE main", NULL, err, sizeof err));
+    CHECK(contains(err, "exists"));
+    CHECK(!db_exec(db, "USE ghost", NULL, err, sizeof err));
+    CHECK(contains(err, "no such database"));
+
+    db_free(db);
+}
+
+/* ---- persistence: save + reload across instances (v2.0) ----------------- */
+
+static void test_persistence(void) {
+    char err[256];
+    char *out = NULL;
+    const char *path = "build/test_persist.db";
+    remove(path);
+
+    /* session 1: populate a file-backed instance, then close (checkpoints) */
+    {
+        Instance *db = instance_open(path, DEFAULT_BLOCK_SIZE);
+        CHECK(db != NULL);
+        CHECK(db_exec(db, "CREATE DATABASE app", NULL, err, sizeof err));
+        CHECK(db_exec(db, "USE app", NULL, err, sizeof err));
+        CHECK(db_exec(db, "CREATE TABLE u (id INT, name TEXT)", NULL, err, sizeof err));
+        for (int i = 0; i < 300; i++) { /* enough rows to span blocks/extents */
+            char sql[96];
+            snprintf(sql, sizeof sql, "INSERT INTO u VALUES (%d, 'name%d')", i, i);
+            db_exec(db, sql, NULL, err, sizeof err);
+        }
+        db_exec(db, "DELETE FROM u WHERE id = 150", NULL, err, sizeof err);
+        db_free(db);
+    }
+
+    /* session 2: reopen the same file and verify everything survived */
+    {
+        Instance *db = instance_open(path, DEFAULT_BLOCK_SIZE);
+        CHECK(db != NULL);
+        CHECK(db_exec(db, "USE app", NULL, err, sizeof err));
+
+        CHECK(db_exec(db, "SELECT COUNT(*) FROM u", &out, err, sizeof err));
+        CHECK(contains(out, "299")); /* 300 inserted - 1 deleted */
+        free(out);
+
+        /* exact values reload correctly, deleted row stays gone */
+        CHECK(db_exec(db, "SELECT name FROM u WHERE id = 299", &out, err, sizeof err));
+        CHECK(contains(out, "name299"));
+        free(out);
+        CHECK(db_exec(db, "SELECT id FROM u WHERE id = 150", &out, err, sizeof err));
+        CHECK(contains(out, "(0 rows)"));
+        free(out);
+
+        /* a further mutation persists too */
+        CHECK(db_exec(db, "INSERT INTO u VALUES (1000, 'later')", NULL, err, sizeof err));
+        db_free(db);
+    }
+
+    /* session 3: confirm the post-reload insert also persisted */
+    {
+        Instance *db = instance_open(path, DEFAULT_BLOCK_SIZE);
+        CHECK(db_exec(db, "USE app", NULL, err, sizeof err));
+        CHECK(db_exec(db, "SELECT COUNT(*) FROM u", &out, err, sizeof err));
+        CHECK(contains(out, "300"));
+        free(out);
+        db_free(db);
+    }
+
+    remove(path);
+}
+
+/* ---- SHOW / parameters (v2.1) ------------------------------------------- */
+
+static void test_show_and_params(void) {
+    Instance *db = db_new();
+    char err[256];
+    char *out = NULL;
+
+    db_exec(db, "CREATE TABLE t (a INT, b TEXT)", NULL, err, sizeof err);
+
+    /* SHOW TABLES / DATABASES / CREATE TABLE (MySQL-style, no dots) */
+    CHECK(db_exec(db, "SHOW TABLES", &out, err, sizeof err));
+    CHECK(contains(out, "t"));
+    free(out);
+    CHECK(db_exec(db, "SHOW DATABASES", &out, err, sizeof err));
+    CHECK(contains(out, "main"));
+    free(out);
+    CHECK(db_exec(db, "SHOW CREATE TABLE t", &out, err, sizeof err));
+    CHECK(contains(out, "CREATE TABLE t (a INT, b TEXT)"));
+    free(out);
+    CHECK(!db_exec(db, "SHOW CREATE TABLE nope", NULL, err, sizeof err));
+    CHECK(contains(err, "no such table"));
+
+    /* a fresh instance seeds default global params */
+    CHECK(db_exec(db, "SHOW GLOBAL PARAMETERS", &out, err, sizeof err));
+    CHECK(contains(out, "block_size"));
+    CHECK(contains(out, "8192"));
+    CHECK(contains(out, "data_file"));
+    free(out);
+
+    /* per-db params are seeded from the global defaults on db creation */
+    CHECK(db_exec(db, "SHOW PARAMETERS", &out, err, sizeof err));
+    CHECK(contains(out, "block_size"));
+    free(out);
+
+    /* SET (db-scoped) and SET GLOBAL */
+    CHECK(db_exec(db, "SET retention = '30d'", &out, err, sizeof err));
+    CHECK(contains(out, "database parameter"));
+    free(out);
+    CHECK(db_exec(db, "SHOW PARAMETERS", &out, err, sizeof err));
+    CHECK(contains(out, "retention"));
+    CHECK(contains(out, "30d"));
+    free(out);
+
+    CHECK(db_exec(db, "SET GLOBAL block_size = 16384", &out, err, sizeof err));
+    CHECK(contains(out, "global parameter"));
+    free(out);
+    CHECK(db_exec(db, "SHOW GLOBAL PARAMETERS", &out, err, sizeof err));
+    CHECK(contains(out, "16384"));
+    free(out);
+
+    /* block_size is validated */
+    CHECK(!db_exec(db, "SET GLOBAL block_size = 99", NULL, err, sizeof err));
+    CHECK(contains(err, "block_size"));
+
+    /* a new database gets the global defaults copied in */
+    CHECK(db_exec(db, "CREATE DATABASE d2", NULL, err, sizeof err));
+    CHECK(db_exec(db, "USE d2", NULL, err, sizeof err));
+    CHECK(db_exec(db, "SHOW PARAMETERS", &out, err, sizeof err));
+    CHECK(contains(out, "block_size"));
+    CHECK(!contains(out, "retention")); /* per-db param stayed in 'main' */
+    free(out);
+
+    /* HELP prints something */
+    CHECK(db_exec(db, "HELP", &out, err, sizeof err));
+    CHECK(contains(out, "SHOW"));
+    free(out);
+
+    db_free(db);
+}
+
+/* ---- runtime block size + persistence (v2.1) ---------------------------- */
+
+static void test_block_size_persist(void) {
+    char err[256];
+    char *out = NULL;
+    const char *path = "build/test_bs.db";
+    remove(path);
+
+    /* create a file with a non-default 512-byte block size */
+    {
+        Instance *db = instance_open(path, 512);
+        CHECK(db != NULL);
+        db_exec(db, "CREATE TABLE t (id INT, s TEXT)", NULL, err, sizeof err);
+        bool ok = true;
+        for (int i = 0; i < 300; i++) { /* many small blocks + extents at 512B */
+            char sql[96];
+            snprintf(sql, sizeof sql, "INSERT INTO t VALUES (%d, 'row%d')", i, i);
+            if (!db_exec(db, sql, NULL, err, sizeof err)) { ok = false; break; }
+        }
+        CHECK(ok);
+        db_free(db);
+    }
+
+    /* reopen requesting a different size: the file's stored 512 must win */
+    {
+        Instance *db = instance_open(path, 16384);
+        CHECK(db != NULL);
+        CHECK(db_exec(db, "SHOW GLOBAL PARAMETERS", &out, err, sizeof err));
+        CHECK(contains(out, "512"));
+        CHECK(!contains(out, "16384"));
+        free(out);
+
+        CHECK(db_exec(db, "SELECT COUNT(*) FROM t", &out, err, sizeof err));
+        CHECK(contains(out, "300"));
+        free(out);
+        CHECK(db_exec(db, "SELECT s FROM t WHERE id = 299", &out, err, sizeof err));
+        CHECK(contains(out, "row299"));
+        free(out);
+        db_free(db);
+    }
+
+    remove(path);
+}
+
 /* ---- error handling ----------------------------------------------------- */
 
 static void test_errors(void) {
-    Database *db = db_new();
+    Instance *db = db_new();
     char err[256];
 
     CHECK(db_exec(db, "CREATE TABLE e (a INT, b TEXT)", NULL, err, sizeof err));
@@ -284,7 +549,7 @@ static void test_errors(void) {
 /* ---- integer overflow --------------------------------------------------- */
 
 static void test_overflow(void) {
-    Database *db = db_new();
+    Instance *db = db_new();
     char err[256];
     char *out = NULL;
 
@@ -315,7 +580,7 @@ static void test_overflow(void) {
 /* ---- string escaping ---------------------------------------------------- */
 
 static void test_string_escape(void) {
-    Database *db = db_new();
+    Instance *db = db_new();
     char err[256];
     char *out = NULL;
 
@@ -334,7 +599,7 @@ static void test_string_escape(void) {
 #define BIG 100000
 
 static void test_large_insert_select(void) {
-    Database *db = db_new();
+    Instance *db = db_new();
     char err[256];
     char *out = NULL;
 
@@ -370,7 +635,7 @@ static void test_large_insert_select(void) {
 
 static void test_many_tables(void) {
     for (int rep = 0; rep < 50; rep++) {
-        Database *db = db_new();
+        Instance *db = db_new();
         char err[256];
         for (int i = 0; i < 100; i++) {
             char sql[96];
@@ -393,7 +658,12 @@ int main(void) {
     RUN(test_where_operators);
     RUN(test_aggregates);
     RUN(test_order_by);
-    RUN(test_pages);
+    RUN(test_blocks);
+    RUN(test_delete);
+    RUN(test_databases);
+    RUN(test_persistence);
+    RUN(test_show_and_params);
+    RUN(test_block_size_persist);
     RUN(test_errors);
     RUN(test_overflow);
     RUN(test_string_escape);

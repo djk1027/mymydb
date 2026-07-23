@@ -29,7 +29,7 @@ static void report(const char *name, long rows, double secs) {
 }
 
 /* Parse+execute one statement, output discarded. Aborts the bench on error. */
-static void must_exec(Database *db, const char *sql, FILE *sink) {
+static void must_exec(Instance *db, const char *sql, FILE *sink) {
     char err[256];
     Stmt *s = parse_statement(sql, err, sizeof err);
     if (!s) { fprintf(stderr, "parse error: %s\n(%s)\n", err, sql); exit(1); }
@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
     printf("  %-26s %14s %11s %16s %12s\n",
            "workload", "rows", "time", "throughput", "latency");
 
-    Database *db = db_new();
+    Instance *db = db_new();
     must_exec(db, "CREATE TABLE b (id INT, label TEXT)", sink);
 
     /* --- 1. INSERT throughput (end-to-end: parse + execute) --- */

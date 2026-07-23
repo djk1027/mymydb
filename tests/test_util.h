@@ -46,7 +46,7 @@ static inline int contains(const char *hay, const char *needle) {
  * On success returns true; if out != NULL, *out receives the malloc'd result
  * text (caller frees). On failure returns false and writes the message to err.
  */
-static inline bool db_exec(Database *db, const char *sql,
+static inline bool db_exec(Instance *db, const char *sql,
                            char **out, char *err, size_t errcap) {
     if (out) *out = NULL;
     if (err && errcap) err[0] = '\0';

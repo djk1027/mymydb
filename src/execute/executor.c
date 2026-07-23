@@ -62,14 +62,14 @@ static bool exec_insert(Database *db, const InsertStmt *ins, FILE *out,
         }
     }
 
-    /* Page storage copies the row in; we always own the transient cells. */
+    /* Block storage copies the row in; we always own the transient cells. */
     bool stored = table_append_row(t, cells);
     for (int i = 0; i < t->ncols; i++) value_free(&cells[i]);
     free(cells);
 
     if (!stored) {
-        snprintf(errbuf, errcap, "row too large to fit in a %d-byte page",
-                 PAGE_SIZE);
+        snprintf(errbuf, errcap, "row too large to fit in a %u-byte block",
+                 t->block_size);
         return false;
     }
     fprintf(out, "OK: 1 row inserted into '%s'\n", t->name);
@@ -396,15 +396,234 @@ static bool exec_select(Database *db, const SelectStmt *sel, FILE *out,
     return true;
 }
 
+/* ---- DELETE ------------------------------------------------------------- */
+
+static bool exec_delete(Database *db, const DeleteStmt *del, FILE *out,
+                        char *errbuf, int errcap) {
+    Table *t = db_find_table(db, del->table);
+    if (!t) {
+        snprintf(errbuf, errcap, "no such table: %s", del->table);
+        return false;
+    }
+    if (!optimizer_check_where(t, del->where, errbuf, errcap))
+        return false;
+
+    Value *scratch = malloc(t->ncols * sizeof(Value));
+    TableCursor cur;
+    table_cursor_init(&cur, t);
+    int deleted = 0;
+    while (table_cursor_next(&cur, scratch)) {
+        Row tmp = {scratch};
+        bool match = eval_pred(del->where, t, &tmp);
+        for (int c = 0; c < t->ncols; c++) value_free(&scratch[c]);
+        if (match) {
+            /* Tombstoning the just-returned slot is safe: it doesn't shift
+             * other slots and the cursor has already advanced past it. */
+            table_delete_at(t, cur.cur_block, cur.cur_slot);
+            deleted++;
+        }
+    }
+    free(scratch);
+
+    fprintf(out, "OK: %d row%s deleted from '%s'\n",
+            deleted, deleted == 1 ? "" : "s", t->name);
+    return true;
+}
+
+/* ---- CREATE DATABASE / USE ---------------------------------------------- */
+
+static bool exec_create_database(Instance *inst, const DbStmt *s, FILE *out,
+                                 char *errbuf, int errcap) {
+    if (!instance_create_db(inst, s->name)) {
+        snprintf(errbuf, errcap, "database already exists: %s", s->name);
+        return false;
+    }
+    fprintf(out, "OK: database '%s' created\n", s->name);
+    return true;
+}
+
+static bool exec_use(Instance *inst, const DbStmt *s, FILE *out,
+                     char *errbuf, int errcap) {
+    if (!instance_use(inst, s->name)) {
+        snprintf(errbuf, errcap, "no such database: %s", s->name);
+        return false;
+    }
+    fprintf(out, "OK: using database '%s'\n", s->name);
+    return true;
+}
+
+/* ---- SHOW / SET / HELP (v2.1) ------------------------------------------- */
+
+/* Renders a single borrowed-string column. items[] are not freed. */
+static void render_list(FILE *out, const char *header, int n,
+                        const char **items) {
+    char *hdr = strdup(header);
+    char ***cells = malloc((n ? n : 1) * sizeof(char **));
+    for (int i = 0; i < n; i++) {
+        cells[i] = malloc(sizeof(char *));
+        cells[i][0] = (char *)items[i];
+    }
+    render(out, 1, &hdr, n, cells);
+    for (int i = 0; i < n; i++) free(cells[i]);
+    free(cells);
+    free(hdr);
+}
+
+/* Renders a parameter store as a name | value table. */
+static void render_params(FILE *out, const ParamStore *s) {
+    char *hdr[2] = {strdup("name"), strdup("value")};
+    char ***cells = malloc((s->n ? s->n : 1) * sizeof(char **));
+    for (int i = 0; i < s->n; i++) {
+        cells[i] = malloc(2 * sizeof(char *));
+        cells[i][0] = s->items[i].name;
+        cells[i][1] = s->items[i].value;
+    }
+    render(out, 2, hdr, s->n, cells);
+    for (int i = 0; i < s->n; i++) free(cells[i]);
+    free(cells);
+    free(hdr[0]);
+    free(hdr[1]);
+}
+
+static bool exec_show(Instance *inst, const ShowStmt *sh, FILE *out,
+                      char *errbuf, int errcap) {
+    Database *db = instance_current(inst);
+
+    switch (sh->kind) {
+        case SHOW_DATABASES: {
+            int n = 0;
+            for (Database *d = inst->databases; d; d = d->next) n++;
+            const char **names = malloc((n ? n : 1) * sizeof(char *));
+            int i = 0;
+            for (Database *d = inst->databases; d; d = d->next) names[i++] = d->name;
+            render_list(out, "Database", n, names);
+            free(names);
+            return true;
+        }
+        case SHOW_TABLES: {
+            int n = 0;
+            for (Table *t = db->tables; t; t = t->next) n++;
+            const char **names = malloc((n ? n : 1) * sizeof(char *));
+            int i = 0;
+            for (Table *t = db->tables; t; t = t->next) names[i++] = t->name;
+            char header[MAX_NAME + 16];
+            snprintf(header, sizeof header, "Tables_in_%s", db->name);
+            render_list(out, header, n, names);
+            free(names);
+            return true;
+        }
+        case SHOW_PARAMETERS:
+            render_params(out, &db->params);
+            return true;
+        case SHOW_GLOBAL_PARAMETERS:
+            render_params(out, &inst->globals);
+            return true;
+        case SHOW_CREATE_TABLE: {
+            Table *t = db_find_table(db, sh->name);
+            if (!t) {
+                snprintf(errbuf, errcap, "no such table: %s", sh->name);
+                return false;
+            }
+            char ddl[1024];
+            int off = snprintf(ddl, sizeof ddl, "CREATE TABLE %s (", t->name);
+            for (int c = 0; c < t->ncols && off < (int)sizeof ddl; c++)
+                off += snprintf(ddl + off, sizeof ddl - off, "%s%s %s",
+                                c ? ", " : "", t->cols[c].name,
+                                coltype_name(t->cols[c].type));
+            if (off < (int)sizeof ddl) snprintf(ddl + off, sizeof ddl - off, ")");
+
+            char *hdr[2] = {strdup("Table"), strdup("Create Table")};
+            char ***cells = malloc(sizeof(char **));
+            cells[0] = malloc(2 * sizeof(char *));
+            cells[0][0] = t->name;
+            cells[0][1] = ddl;
+            render(out, 2, hdr, 1, cells);
+            free(cells[0]);
+            free(cells);
+            free(hdr[0]);
+            free(hdr[1]);
+            return true;
+        }
+    }
+    return true;
+}
+
+static bool exec_set(Instance *inst, const SetStmt *st, FILE *out,
+                     char *errbuf, int errcap) {
+    if (strcmp(st->name, "block_size") == 0) {
+        char *end;
+        long v = strtol(st->value, &end, 10);
+        if (*end != '\0' || v < MIN_BLOCK_SIZE || v > MAX_BLOCK_SIZE) {
+            snprintf(errbuf, errcap,
+                     "block_size must be an integer in [%d, %d]",
+                     MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
+            return false;
+        }
+    }
+    ParamStore *store = st->global ? &inst->globals
+                                   : &instance_current(inst)->params;
+    param_set(store, st->name, st->value);
+    fprintf(out, "OK: %s parameter '%s' = %s\n",
+            st->global ? "global" : "database", st->name, st->value);
+    return true;
+}
+
+static void exec_help(FILE *out) {
+    fprintf(out,
+        "mymydb v2.1 — commands:\n"
+        "  CREATE DATABASE app;   USE app;\n"
+        "  CREATE TABLE t (a INT, b TEXT);\n"
+        "  INSERT INTO t VALUES (1, 'hi');\n"
+        "  SELECT * FROM t WHERE a >= 1 ORDER BY a DESC;\n"
+        "  SELECT COUNT(*), SUM(a) FROM t;\n"
+        "  DELETE FROM t WHERE a = 1;\n"
+        "  SHOW DATABASES;   SHOW TABLES;   SHOW CREATE TABLE t;\n"
+        "  SHOW PARAMETERS;  SHOW GLOBAL PARAMETERS;\n"
+        "  SET GLOBAL block_size = 16384;   SET key = 'value';\n"
+        "  HELP;   EXIT;\n");
+}
+
 /* ---- dispatch ----------------------------------------------------------- */
 
-bool execute(Database *db, const Stmt *stmt, FILE *out,
+bool execute(Instance *inst, const Stmt *stmt, FILE *out,
              char *errbuf, int errcap) {
+    Database *db = instance_current(inst);
+    bool ok;
+
     switch (stmt->type) {
-        case STMT_CREATE: return exec_create(db, &stmt->as.create, out, errbuf, errcap);
-        case STMT_INSERT: return exec_insert(db, &stmt->as.insert, out, errbuf, errcap);
-        case STMT_SELECT: return exec_select(db, &stmt->as.select, out, errbuf, errcap);
+        case STMT_CREATE:
+            ok = exec_create(db, &stmt->as.create, out, errbuf, errcap);
+            break;
+        case STMT_INSERT:
+            ok = exec_insert(db, &stmt->as.insert, out, errbuf, errcap);
+            break;
+        case STMT_SELECT:
+            return exec_select(db, &stmt->as.select, out, errbuf, errcap);
+        case STMT_DELETE:
+            ok = exec_delete(db, &stmt->as.del, out, errbuf, errcap);
+            break;
+        case STMT_CREATE_DATABASE:
+            ok = exec_create_database(inst, &stmt->as.db, out, errbuf, errcap);
+            break;
+        case STMT_USE:
+            return exec_use(inst, &stmt->as.db, out, errbuf, errcap);
+        case STMT_SHOW:
+            return exec_show(inst, &stmt->as.show, out, errbuf, errcap);
+        case STMT_SET:
+            ok = exec_set(inst, &stmt->as.set, out, errbuf, errcap);
+            break;
+        case STMT_HELP:
+            exec_help(out);
+            return true;
+        case STMT_EXIT:
+            /* The REPL intercepts EXIT before executing; treat as a no-op. */
+            return true;
+        default:
+            snprintf(errbuf, errcap, "unknown statement type");
+            return false;
     }
-    snprintf(errbuf, errcap, "unknown statement type");
-    return false;
+
+    /* Persist successful mutations (no-op for a memory-only instance). */
+    if (ok) instance_checkpoint(inst);
+    return ok;
 }

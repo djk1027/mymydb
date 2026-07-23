@@ -44,4 +44,10 @@ bool optimizer_plan_select(Database *db, const SelectStmt *sel,
 
 void plan_free(Plan *plan);
 
+/* Verifies every column referenced in a WHERE tree exists in t (used by DELETE,
+ * which needs no full plan). Returns false and fills errbuf on an unknown
+ * column. */
+bool optimizer_check_where(const Table *t, const Expr *where,
+                           char *errbuf, int errcap);
+
 #endif /* MYMYDB_OPTIMIZER_H */
