@@ -32,6 +32,17 @@ typedef struct {
     int *order_col;
     bool *order_desc;
     int norder;
+
+    /* Index access (v2.3): when use_index, scan `index` driven by a single
+     * comparison `idx_op idx_bound` on its first column (table col idx_driving);
+     * the full filter is still re-checked per row. covering means every column
+     * the query needs is in the index, so data blocks are not read. */
+    bool use_index;
+    Index *index;
+    int idx_driving;
+    OpKind idx_op;
+    Value idx_bound;
+    bool covering;
 } Plan;
 
 /*

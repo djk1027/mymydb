@@ -73,6 +73,15 @@ uint32_t table_phys_block(const Table *t, int seq);
  */
 bool table_append_row(Table *t, const Value *cells);
 
+/* Like table_append_row but reports where the row landed (block index, slot),
+ * which callers use as a row locator for index entries. */
+bool table_append_row_loc(Table *t, const Value *cells,
+                          int *out_block, int *out_slot);
+
+/* Materializes the row at (block index, slot) into cells (owned Values).
+ * Returns false if the location is out of range or tombstoned. */
+bool table_read_at(const Table *t, int block_idx, int slot, Value *cells);
+
 /* Marks the row at (block index, slot) deleted (tombstones its slot). */
 void table_delete_at(Table *t, int block_idx, int slot);
 

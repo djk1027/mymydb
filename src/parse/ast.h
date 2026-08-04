@@ -67,6 +67,10 @@ typedef enum {
     STMT_SET,     /* SET [GLOBAL] name = value */
     STMT_HELP,    /* HELP */
     STMT_EXIT,    /* EXIT / QUIT (handled by the REPL) */
+    STMT_CHECKPOINT, /* CHECKPOINT: flush all databases to disk */
+    STMT_UPDATE,       /* UPDATE t SET col = val, ... WHERE ... */
+    STMT_CREATE_INDEX, /* CREATE INDEX name ON t (col, ...) */
+    STMT_DROP_INDEX,   /* DROP INDEX name */
 } StmtType;
 
 typedef enum {
@@ -121,6 +125,21 @@ typedef struct {
     Expr *where;          /* nullable: DELETE FROM t with no WHERE clears all */
 } DeleteStmt;
 
+typedef struct {
+    char table[MAX_NAME];
+    char **cols;          /* columns being assigned (arena) */
+    Value *vals;          /* assigned literals, parallel to cols (arena) */
+    int nset;
+    Expr *where;          /* nullable */
+} UpdateStmt;
+
+typedef struct {
+    char name[MAX_NAME];
+    char table[MAX_NAME];
+    char **cols;          /* indexed column names (arena) */
+    int ncols;
+} CreateIndexStmt;
+
 /* CREATE DATABASE <name> / USE <name> */
 typedef struct {
     char name[MAX_NAME];
@@ -137,6 +156,8 @@ typedef struct {
         DbStmt db;
         ShowStmt show;
         SetStmt set;
+        UpdateStmt update;
+        CreateIndexStmt create_index;
     } as;
 } Stmt;
 

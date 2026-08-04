@@ -65,12 +65,13 @@ static void serialize_tuple(const Table *t, const Value *cells, uint8_t *dst) {
     }
 }
 
-static bool block_insert(uint8_t *d, const Table *t, const Value *cells, int size) {
+/* Inserts a serialized tuple; returns the new slot index, or -1 if no room. */
+static int block_insert(uint8_t *d, const Table *t, const Value *cells, int size) {
     uint16_t nslots = blk_nslots(d);
     uint16_t free_end = blk_free_end(d);
     uint16_t free_start = HDR_SIZE + nslots * SLOT_SIZE;
 
-    if (free_end - free_start < size + SLOT_SIZE) return false;
+    if (free_end - free_start < size + SLOT_SIZE) return -1;
 
     uint16_t off = free_end - (uint16_t)size;
     serialize_tuple(t, cells, d + off);
@@ -81,7 +82,7 @@ static bool block_insert(uint8_t *d, const Table *t, const Value *cells, int siz
 
     wr16(d, (uint16_t)(nslots + 1));
     wr16(d + 2, off);
-    return true;
+    return nslots;
 }
 
 static void deserialize_tuple(const Table *t, const uint8_t *d, int s, Value *cells) {
@@ -182,15 +183,19 @@ uint32_t table_phys_block(const Table *t, int seq) {
     return 0; /* seq out of range (shouldn't happen) */
 }
 
-bool table_append_row(Table *t, const Value *cells) {
+bool table_append_row_loc(Table *t, const Value *cells,
+                          int *out_block, int *out_slot) {
     int size = tuple_size(t, cells);
     if (size < 0) return false;
 
     if (t->nblocks_used > 0) {
         Block *b = t->blocks[t->nblocks_used - 1];
-        if (block_insert(b->data, t, cells, size)) {
+        int slot = block_insert(b->data, t, cells, size);
+        if (slot >= 0) {
             b->dirty = true;
             t->nrows++;
+            if (out_block) *out_block = t->nblocks_used - 1;
+            if (out_slot) *out_slot = slot;
             return true;
         }
     }
@@ -200,9 +205,26 @@ bool table_append_row(Table *t, const Value *cells) {
     if ((uint32_t)t->nblocks_used == t->capacity_blocks)
         grow_extent(t);
 
-    Block *b = make_block(t, t->nblocks_used, true);
-    block_insert(b->data, t, cells, size); /* fits: size was validated */
+    int idx = t->nblocks_used;
+    Block *b = make_block(t, idx, true);
+    int slot = block_insert(b->data, t, cells, size); /* fits: size validated */
     t->nrows++;
+    if (out_block) *out_block = idx;
+    if (out_slot) *out_slot = slot;
+    return true;
+}
+
+bool table_append_row(Table *t, const Value *cells) {
+    return table_append_row_loc(t, cells, NULL, NULL);
+}
+
+bool table_read_at(const Table *t, int block_idx, int slot, Value *cells) {
+    if (block_idx < 0 || block_idx >= t->nblocks_used) return false;
+    const uint8_t *d = t->blocks[block_idx]->data;
+    if (slot < 0 || slot >= blk_nslots(d)) return false;
+    const uint8_t *s = d + HDR_SIZE + slot * SLOT_SIZE;
+    if (rd16(s) == 0) return false; /* tombstoned */
+    deserialize_tuple(t, d, slot, cells);
     return true;
 }
 

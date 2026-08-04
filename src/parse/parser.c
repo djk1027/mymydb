@@ -209,6 +209,32 @@ static ColType parse_coltype(Parser *p) {
     return TYPE_INT; /* unreachable */
 }
 
+static Stmt *parse_create_index(Parser *p) {
+    Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
+    s->type = STMT_CREATE_INDEX;
+    take_ident(p, s->as.create_index.name, MAX_NAME, "index name");
+    expect_kw(p, "ON");
+    take_ident(p, s->as.create_index.table, MAX_NAME, "table name");
+    expect(p, TOK_LPAREN, "'('");
+
+    int cap = 4, n = 0;
+    char **cols = arena_alloc(p->arena, cap * sizeof(char *));
+    do {
+        if (n == cap) {
+            int newcap = cap * 2;
+            cols = arena_realloc(p->arena, cols, cap * sizeof(char *),
+                                 newcap * sizeof(char *));
+            cap = newcap;
+        }
+        cols[n++] = dup_ident(p, "column name");
+    } while (accept(p, TOK_COMMA));
+    expect(p, TOK_RPAREN, "')'");
+
+    s->as.create_index.cols = cols;
+    s->as.create_index.ncols = n;
+    return s;
+}
+
 static Stmt *parse_create(Parser *p) {
     if (accept_kw(p, "DATABASE")) {
         Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
@@ -216,6 +242,8 @@ static Stmt *parse_create(Parser *p) {
         take_ident(p, s->as.db.name, MAX_NAME, "database name");
         return s;
     }
+    if (accept_kw(p, "INDEX"))
+        return parse_create_index(p);
 
     expect_kw(p, "TABLE");
 
@@ -406,6 +434,46 @@ static Stmt *parse_use(Parser *p) {
     return s;
 }
 
+static Stmt *parse_update(Parser *p) {
+    Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
+    s->type = STMT_UPDATE;
+    take_ident(p, s->as.update.table, MAX_NAME, "table name");
+    expect_kw(p, "SET");
+
+    int cap = 4, n = 0;
+    char **cols = arena_alloc(p->arena, cap * sizeof(char *));
+    Value *vals = arena_alloc(p->arena, cap * sizeof(Value));
+    do {
+        if (n == cap) {
+            int newcap = cap * 2;
+            cols = arena_realloc(p->arena, cols, cap * sizeof(char *),
+                                 newcap * sizeof(char *));
+            vals = arena_realloc(p->arena, vals, cap * sizeof(Value),
+                                 newcap * sizeof(Value));
+            cap = newcap;
+        }
+        cols[n] = dup_ident(p, "column name");
+        expect(p, TOK_EQ, "'='");
+        vals[n] = parse_literal(p);
+        n++;
+    } while (accept(p, TOK_COMMA));
+
+    s->as.update.cols = cols;
+    s->as.update.vals = vals;
+    s->as.update.nset = n;
+    if (accept_kw(p, "WHERE"))
+        s->as.update.where = parse_or(p);
+    return s;
+}
+
+static Stmt *parse_drop(Parser *p) {
+    expect_kw(p, "INDEX");
+    Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
+    s->type = STMT_DROP_INDEX;
+    take_ident(p, s->as.db.name, MAX_NAME, "index name");
+    return s;
+}
+
 static Stmt *parse_show(Parser *p) {
     Stmt *s = arena_calloc(p->arena, sizeof(Stmt));
     s->type = STMT_SHOW;
@@ -477,10 +545,13 @@ Stmt *parse_statement(const char *sql, char *errbuf, int errcap) {
     else if (accept_kw(&p, "INSERT")) s = parse_insert(&p);
     else if (accept_kw(&p, "SELECT")) s = parse_select(&p);
     else if (accept_kw(&p, "DELETE")) s = parse_delete(&p);
+    else if (accept_kw(&p, "UPDATE")) s = parse_update(&p);
+    else if (accept_kw(&p, "DROP"))   s = parse_drop(&p);
     else if (accept_kw(&p, "USE"))    s = parse_use(&p);
     else if (accept_kw(&p, "SHOW"))   s = parse_show(&p);
     else if (accept_kw(&p, "SET"))    s = parse_set(&p);
     else if (accept_kw(&p, "HELP"))   s = parse_bare(&p, STMT_HELP);
+    else if (accept_kw(&p, "CHECKPOINT")) s = parse_bare(&p, STMT_CHECKPOINT);
     else if (accept_kw(&p, "EXIT") ||
              accept_kw(&p, "QUIT"))   s = parse_bare(&p, STMT_EXIT);
     else { fail(&p, "unknown statement near '%.*s'",

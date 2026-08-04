@@ -38,6 +38,10 @@ target/
 /mymydb
 /build/
 
+# mymydb instance dirs (the default base $HOME/mymydb can coincide with the repo)
+/bin/
+/data/
+
 # Python
 __pycache__/
 *.pyc

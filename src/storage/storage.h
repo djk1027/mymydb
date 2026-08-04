@@ -19,6 +19,7 @@
 #include "param.h"
 #include "pager.h"
 #include "table.h"
+#include "index.h"
 #include "database.h"
 #include "instance.h"
 

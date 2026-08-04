@@ -38,6 +38,18 @@ static bool coerce(const Value *lit, ColType want, Value *out,
     return false;
 }
 
+/* Keeps every index on t in sync with a row insert/delete. */
+static void indexes_add(Database *db, const Table *t, const Value *cells,
+                        RowLoc loc) {
+    for (Index *ix = db->indexes; ix; ix = ix->next)
+        if (ix->table_id == t->obj.id) index_insert(ix, cells, loc);
+}
+static void indexes_remove(Database *db, const Table *t, const Value *cells,
+                           RowLoc loc) {
+    for (Index *ix = db->indexes; ix; ix = ix->next)
+        if (ix->table_id == t->obj.id) index_delete(ix, cells, loc);
+}
+
 static bool exec_insert(Database *db, const InsertStmt *ins, FILE *out,
                         char *errbuf, int errcap) {
     Table *t = db_find_table(db, ins->table);
@@ -63,7 +75,11 @@ static bool exec_insert(Database *db, const InsertStmt *ins, FILE *out,
     }
 
     /* Block storage copies the row in; we always own the transient cells. */
-    bool stored = table_append_row(t, cells);
+    int blk, slot;
+    bool stored = table_append_row_loc(t, cells, &blk, &slot);
+    if (stored)
+        indexes_add(db, t, cells, (RowLoc){.block = (uint32_t)blk,
+                                           .slot = (uint16_t)slot});
     for (int i = 0; i < t->ncols; i++) value_free(&cells[i]);
     free(cells);
 
@@ -188,32 +204,111 @@ static int row_cmp(const void *pa, const void *pb) {
     return 0;
 }
 
-/* Collects every row passing the filter as an owned materialized-row vector. */
-static Row *scan_rows(const Plan *plan, const Table *t, int *out_n) {
+static void free_cells(Value *cells, int n) {
+    for (int i = 0; i < n; i++) value_free(&cells[i]);
+}
+
+/* Compares a possibly-null driving column value against a non-null bound. */
+static int drv_cmp(const Value *v, const Value *bound) {
+    if (v->is_null) return -1;
+    if (v->type != bound->type) return 0;
+    return cmp_values(v, bound);
+}
+
+/*
+ * Iterates rows matching the plan's filter, calling fn(cells, ctx) for each.
+ * Uses the chosen index (point/range on its first column, with the full filter
+ * re-checked) when plan->use_index, otherwise a full table scan. For a covering
+ * index scan the row is served from the index leaf without reading data blocks.
+ * The cells passed to fn are only valid for the duration of the call.
+ */
+typedef void (*RowFn)(const Value *cells, void *ctx);
+
+static void foreach_match(const Plan *plan, const Table *t, RowFn fn, void *ctx) {
     int ncols = t->ncols;
-    Row *rows = NULL;
-    int n = 0, cap = 0;
 
-    Value *scratch = malloc(ncols * sizeof(Value));
-    TableCursor cur;
-    table_cursor_init(&cur, t);
-    while (table_cursor_next(&cur, scratch)) {
-        Row tmp = {scratch};
-        if (eval_pred(plan->filter, t, &tmp)) {
-            if (n == cap) {
-                cap = cap ? cap * 2 : 16;
-                rows = realloc(rows, cap * sizeof(Row));
-            }
-            rows[n++].cells = scratch;             /* keep this buffer */
-            scratch = malloc(ncols * sizeof(Value)); /* fresh one for next row */
-        } else {
-            for (int c = 0; c < ncols; c++) value_free(&scratch[c]);
+    if (!plan->use_index) {
+        Value *scratch = malloc(ncols * sizeof(Value));
+        TableCursor cur;
+        table_cursor_init(&cur, t);
+        while (table_cursor_next(&cur, scratch)) {
+            Row r = {scratch};
+            if (eval_pred(plan->filter, t, &r)) fn(scratch, ctx);
+            free_cells(scratch, ncols);
         }
+        free(scratch);
+        return;
     }
-    free(scratch); /* last (unused / already-freed) buffer */
 
-    *out_n = n;
-    return rows;
+    Index *ix = plan->index;
+    OpKind op = plan->idx_op;
+    const Value *bound = &plan->idx_bound;
+
+    /* Start the scan at the bound for =,>,>=; at the smallest key for <,<=. */
+    Value *lowrow = NULL;
+    if (op == OP_EQ || op == OP_GT || op == OP_GE) {
+        lowrow = malloc(ncols * sizeof(Value));
+        for (int c = 0; c < ncols; c++) lowrow[c] = value_null(t->cols[c].type);
+        lowrow[plan->idx_driving] = *bound; /* borrowed */
+    }
+    IndexCursor c;
+    index_scan_begin(ix, &c, lowrow, lowrow ? 1 : 0);
+
+    Value *keycells = malloc(ix->ncols * sizeof(Value));
+    Value *rowbuf = malloc(ncols * sizeof(Value));
+    RowLoc loc;
+    while (index_scan_next(&c, &loc, keycells)) {
+        int cmp = drv_cmp(&keycells[0], bound);
+        if (op == OP_EQ && cmp != 0) { free_cells(keycells, ix->ncols); break; }
+        if ((op == OP_LT || op == OP_LE) && cmp > 0) {
+            free_cells(keycells, ix->ncols);
+            break;
+        }
+
+        const Value *rowcells = NULL;
+        bool owned = false;
+        if (plan->covering) {
+            for (int cc = 0; cc < ncols; cc++)
+                rowbuf[cc] = value_null(t->cols[cc].type);
+            for (int i = 0; i < ix->ncols; i++)
+                rowbuf[ix->cols[i]] = keycells[i]; /* borrow */
+            rowcells = rowbuf;
+        } else if (table_read_at(t, (int)loc.block, (int)loc.slot, rowbuf)) {
+            rowcells = rowbuf;
+            owned = true;
+        }
+        if (rowcells) {
+            Row r = {(Value *)rowcells};
+            if (eval_pred(plan->filter, t, &r)) fn(rowcells, ctx);
+        }
+        if (owned) free_cells(rowbuf, ncols);
+        free_cells(keycells, ix->ncols);
+    }
+    free(keycells);
+    free(rowbuf);
+    free(lowrow);
+}
+
+/* Collects every matching row as an owned materialized-row vector. */
+typedef struct { Row *rows; int n, cap, ncols; } RowVec;
+
+static void collect_fn(const Value *cells, void *ctx) {
+    RowVec *v = ctx;
+    if (v->n == v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 16;
+        v->rows = realloc(v->rows, v->cap * sizeof(Row));
+    }
+    Value *copy = malloc(v->ncols * sizeof(Value));
+    for (int c = 0; c < v->ncols; c++) copy[c] = value_copy(&cells[c]);
+    v->rows[v->n++].cells = copy;
+}
+
+static Row *scan_rows(const Plan *plan, const Table *t, int *out_n) {
+    RowVec v = {0};
+    v.ncols = t->ncols;
+    foreach_match(plan, t, collect_fn, &v);
+    *out_n = v.n;
+    return v.rows;
 }
 
 static void free_rows(Row *rows, int n, int ncols) {
@@ -340,21 +435,20 @@ static char *agg_result_str(const Plan *plan, int i, const AggAcc *acc) {
     return strdup("NULL");
 }
 
+typedef struct { const Plan *plan; AggAcc *acc; int n; } AggCtx;
+
+static void agg_fn(const Value *cells, void *ctx) {
+    AggCtx *a = ctx;
+    for (int i = 0; i < a->n; i++)
+        agg_fold(a->plan, i, &a->acc[i], cells);
+}
+
 static void run_aggregate(const Plan *plan, const Table *t, FILE *out) {
     int n = plan->naggs;
     AggAcc *acc = calloc(n, sizeof(AggAcc));
 
-    Value *scratch = malloc(t->ncols * sizeof(Value));
-    TableCursor cur;
-    table_cursor_init(&cur, t);
-    while (table_cursor_next(&cur, scratch)) {
-        Row tmp = {scratch};
-        if (eval_pred(plan->filter, t, &tmp))
-            for (int i = 0; i < n; i++)
-                agg_fold(plan, i, &acc[i], scratch);
-        for (int c = 0; c < t->ncols; c++) value_free(&scratch[c]);
-    }
-    free(scratch);
+    AggCtx ctx = {.plan = plan, .acc = acc, .n = n};
+    foreach_match(plan, t, agg_fn, &ctx);
 
     char **header = malloc(n * sizeof(char *));
     char ***cells = malloc(sizeof(char **));
@@ -415,18 +509,161 @@ static bool exec_delete(Database *db, const DeleteStmt *del, FILE *out,
     while (table_cursor_next(&cur, scratch)) {
         Row tmp = {scratch};
         bool match = eval_pred(del->where, t, &tmp);
-        for (int c = 0; c < t->ncols; c++) value_free(&scratch[c]);
         if (match) {
-            /* Tombstoning the just-returned slot is safe: it doesn't shift
-             * other slots and the cursor has already advanced past it. */
+            /* Remove index entries first (needs the row's values), then
+             * tombstone. Doing so mid-scan is safe: slots don't shift and the
+             * cursor has advanced past this row. */
+            indexes_remove(db, t, scratch,
+                           (RowLoc){.block = (uint32_t)cur.cur_block,
+                                    .slot = (uint16_t)cur.cur_slot});
             table_delete_at(t, cur.cur_block, cur.cur_slot);
             deleted++;
         }
+        for (int c = 0; c < t->ncols; c++) value_free(&scratch[c]);
     }
     free(scratch);
 
     fprintf(out, "OK: %d row%s deleted from '%s'\n",
             deleted, deleted == 1 ? "" : "s", t->name);
+    return true;
+}
+
+/* ---- UPDATE ------------------------------------------------------------- */
+
+static bool exec_update(Database *db, const UpdateStmt *up, FILE *out,
+                        char *errbuf, int errcap) {
+    Table *t = db_find_table(db, up->table);
+    if (!t) {
+        snprintf(errbuf, errcap, "no such table: %s", up->table);
+        return false;
+    }
+    if (!optimizer_check_where(t, up->where, errbuf, errcap))
+        return false;
+
+    /* Resolve SET targets and coerce their values to the column types. */
+    int *setcol = malloc(up->nset * sizeof(int));
+    Value *setval = malloc(up->nset * sizeof(Value));
+    for (int i = 0; i < up->nset; i++) {
+        int idx = table_col_index(t, up->cols[i]);
+        if (idx < 0) {
+            snprintf(errbuf, errcap, "unknown column '%s'", up->cols[i]);
+            for (int j = 0; j < i; j++) value_free(&setval[j]);
+            free(setcol); free(setval);
+            return false;
+        }
+        if (!coerce(&up->vals[i], t->cols[idx].type, &setval[i],
+                    errbuf, errcap)) {
+            for (int j = 0; j < i; j++) value_free(&setval[j]);
+            free(setcol); free(setval);
+            return false;
+        }
+        setcol[i] = idx;
+    }
+
+    /* Pass 1: collect matching row locations (so newly appended rows are not
+     * revisited by the scan). */
+    RowLoc *locs = NULL;
+    int nloc = 0, cap = 0;
+    Value *scratch = malloc(t->ncols * sizeof(Value));
+    TableCursor cur;
+    table_cursor_init(&cur, t);
+    while (table_cursor_next(&cur, scratch)) {
+        Row tmp = {scratch};
+        if (eval_pred(up->where, t, &tmp)) {
+            if (nloc == cap) {
+                cap = cap ? cap * 2 : 16;
+                locs = realloc(locs, cap * sizeof(RowLoc));
+            }
+            locs[nloc++] = (RowLoc){.block = (uint32_t)cur.cur_block,
+                                    .slot = (uint16_t)cur.cur_slot};
+        }
+        for (int c = 0; c < t->ncols; c++) value_free(&scratch[c]);
+    }
+    free(scratch);
+
+    /* Pass 2: rewrite each matched row (delete + re-append) and re-key indexes. */
+    int updated = 0;
+    Value *oldc = malloc(t->ncols * sizeof(Value));
+    Value *newc = malloc(t->ncols * sizeof(Value));
+    for (int i = 0; i < nloc; i++) {
+        if (!table_read_at(t, (int)locs[i].block, (int)locs[i].slot, oldc))
+            continue;
+        for (int c = 0; c < t->ncols; c++) newc[c] = value_copy(&oldc[c]);
+        for (int s = 0; s < up->nset; s++) {
+            value_free(&newc[setcol[s]]);
+            newc[setcol[s]] = value_copy(&setval[s]);
+        }
+        indexes_remove(db, t, oldc, locs[i]);
+        table_delete_at(t, (int)locs[i].block, (int)locs[i].slot);
+        int nb, ns;
+        if (table_append_row_loc(t, newc, &nb, &ns))
+            indexes_add(db, t, newc,
+                        (RowLoc){.block = (uint32_t)nb, .slot = (uint16_t)ns});
+        free_cells(oldc, t->ncols);
+        free_cells(newc, t->ncols);
+        updated++;
+    }
+    free(oldc); free(newc); free(locs);
+    for (int i = 0; i < up->nset; i++) value_free(&setval[i]);
+    free(setcol); free(setval);
+
+    fprintf(out, "OK: %d row%s updated in '%s'\n",
+            updated, updated == 1 ? "" : "s", t->name);
+    return true;
+}
+
+/* ---- CREATE INDEX / DROP INDEX ------------------------------------------ */
+
+static bool exec_create_index(Database *db, const CreateIndexStmt *ci, FILE *out,
+                              char *errbuf, int errcap) {
+    Table *t = db_find_table(db, ci->table);
+    if (!t) {
+        snprintf(errbuf, errcap, "no such table: %s", ci->table);
+        return false;
+    }
+    int *cols = malloc(ci->ncols * sizeof(int));
+    ColType *types = malloc(ci->ncols * sizeof(ColType));
+    for (int i = 0; i < ci->ncols; i++) {
+        int idx = table_col_index(t, ci->cols[i]);
+        if (idx < 0) {
+            snprintf(errbuf, errcap, "unknown column '%s'", ci->cols[i]);
+            free(cols); free(types);
+            return false;
+        }
+        cols[i] = idx;
+        types[i] = t->cols[idx].type;
+    }
+
+    Index *ix = db_create_index(db, ci->name, t, cols, types, ci->ncols);
+    free(cols); free(types);
+    if (!ix) {
+        snprintf(errbuf, errcap, "index already exists: %s", ci->name);
+        return false;
+    }
+
+    /* Populate the index from the existing rows. */
+    Value *scratch = malloc(t->ncols * sizeof(Value));
+    TableCursor cur;
+    table_cursor_init(&cur, t);
+    while (table_cursor_next(&cur, scratch)) {
+        index_insert(ix, scratch,
+                     (RowLoc){.block = (uint32_t)cur.cur_block,
+                              .slot = (uint16_t)cur.cur_slot});
+        free_cells(scratch, t->ncols);
+    }
+    free(scratch);
+
+    fprintf(out, "OK: index '%s' created on '%s'\n", ci->name, t->name);
+    return true;
+}
+
+static bool exec_drop_index(Database *db, const DbStmt *s, FILE *out,
+                            char *errbuf, int errcap) {
+    if (!db_drop_index(db, s->name)) {
+        snprintf(errbuf, errcap, "no such index: %s", s->name);
+        return false;
+    }
+    fprintf(out, "OK: index '%s' dropped\n", s->name);
     return true;
 }
 
@@ -570,17 +807,17 @@ static bool exec_set(Instance *inst, const SetStmt *st, FILE *out,
 
 static void exec_help(FILE *out) {
     fprintf(out,
-        "mymydb v2.1 — commands:\n"
-        "  CREATE DATABASE app;   USE app;\n"
-        "  CREATE TABLE t (a INT, b TEXT);\n"
+        "mymydb v2.2 — commands:\n"
+        "  DML/DDL end with ';'; meta commands below run without ';'.\n"
+        "  CREATE DATABASE app;   CREATE TABLE t (a INT, b TEXT);\n"
         "  INSERT INTO t VALUES (1, 'hi');\n"
         "  SELECT * FROM t WHERE a >= 1 ORDER BY a DESC;\n"
         "  SELECT COUNT(*), SUM(a) FROM t;\n"
         "  DELETE FROM t WHERE a = 1;\n"
-        "  SHOW DATABASES;   SHOW TABLES;   SHOW CREATE TABLE t;\n"
-        "  SHOW PARAMETERS;  SHOW GLOBAL PARAMETERS;\n"
-        "  SET GLOBAL block_size = 16384;   SET key = 'value';\n"
-        "  HELP;   EXIT;\n");
+        "  meta:  USE app   SHOW DATABASES   SHOW TABLES   SHOW CREATE TABLE t\n"
+        "         SHOW PARAMETERS   SHOW GLOBAL PARAMETERS\n"
+        "         SET key = 'value'   SET GLOBAL block_size = 16384\n"
+        "         CHECKPOINT   HELP   EXIT\n");
 }
 
 /* ---- dispatch ----------------------------------------------------------- */
@@ -588,42 +825,43 @@ static void exec_help(FILE *out) {
 bool execute(Instance *inst, const Stmt *stmt, FILE *out,
              char *errbuf, int errcap) {
     Database *db = instance_current(inst);
-    bool ok;
 
+    /* Mutations only update the in-memory buffer; durability comes from an
+     * explicit CHECKPOINT or from db_free at shutdown (v2.2). */
     switch (stmt->type) {
         case STMT_CREATE:
-            ok = exec_create(db, &stmt->as.create, out, errbuf, errcap);
-            break;
+            return exec_create(db, &stmt->as.create, out, errbuf, errcap);
         case STMT_INSERT:
-            ok = exec_insert(db, &stmt->as.insert, out, errbuf, errcap);
-            break;
+            return exec_insert(db, &stmt->as.insert, out, errbuf, errcap);
         case STMT_SELECT:
             return exec_select(db, &stmt->as.select, out, errbuf, errcap);
         case STMT_DELETE:
-            ok = exec_delete(db, &stmt->as.del, out, errbuf, errcap);
-            break;
+            return exec_delete(db, &stmt->as.del, out, errbuf, errcap);
+        case STMT_UPDATE:
+            return exec_update(db, &stmt->as.update, out, errbuf, errcap);
+        case STMT_CREATE_INDEX:
+            return exec_create_index(db, &stmt->as.create_index, out, errbuf, errcap);
+        case STMT_DROP_INDEX:
+            return exec_drop_index(db, &stmt->as.db, out, errbuf, errcap);
         case STMT_CREATE_DATABASE:
-            ok = exec_create_database(inst, &stmt->as.db, out, errbuf, errcap);
-            break;
+            return exec_create_database(inst, &stmt->as.db, out, errbuf, errcap);
         case STMT_USE:
             return exec_use(inst, &stmt->as.db, out, errbuf, errcap);
         case STMT_SHOW:
             return exec_show(inst, &stmt->as.show, out, errbuf, errcap);
         case STMT_SET:
-            ok = exec_set(inst, &stmt->as.set, out, errbuf, errcap);
-            break;
+            return exec_set(inst, &stmt->as.set, out, errbuf, errcap);
         case STMT_HELP:
             exec_help(out);
+            return true;
+        case STMT_CHECKPOINT:
+            instance_checkpoint(inst);
+            fprintf(out, "OK: checkpoint complete\n");
             return true;
         case STMT_EXIT:
             /* The REPL intercepts EXIT before executing; treat as a no-op. */
             return true;
-        default:
-            snprintf(errbuf, errcap, "unknown statement type");
-            return false;
     }
-
-    /* Persist successful mutations (no-op for a memory-only instance). */
-    if (ok) instance_checkpoint(inst);
-    return ok;
+    snprintf(errbuf, errcap, "unknown statement type");
+    return false;
 }

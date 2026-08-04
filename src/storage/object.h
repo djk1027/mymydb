@@ -30,6 +30,7 @@
 typedef enum {
     OBJ_DB,     /* a logical database */
     OBJ_TABLE,  /* a table */
+    OBJ_INDEX,  /* a B+tree index */
 } ObjType;
 
 /* Common header embedded at the top of every object struct. */

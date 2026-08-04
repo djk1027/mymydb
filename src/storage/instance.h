@@ -2,51 +2,46 @@
 #define MYMYDB_INSTANCE_H
 
 #include "database.h"
-#include "pager.h"
+#include "param.h"
 
 /*
- * The whole server process's state. An instance owns one or more logical
- * databases and, when file-backed, a pager for durable per-block storage.
- * A memory-only instance (pager == NULL) skips all persistence.
+ * The whole server process's state (v2.2). An instance is rooted at a base
+ * path with `bin/` and `data/` subdirectories. Under `data/`:
+ *   _master        instance registry: global params, next_db_id, db list
+ *   <name>.mdb     one self-contained file per database
  *
- * On-disk layout (file-backed): block 0 is the superblock; a contiguous catalog
- * run stores the serialized object tree; table data lives in extent-allocated
- * blocks. A checkpoint writes dirty blocks + catalog + superblock; opening an
- * existing file reloads the whole tree.
+ * Blocks are buffered in memory and only written on a checkpoint, which runs on
+ * an explicit CHECKPOINT and when the instance is freed (not per mutation).
  */
 typedef struct {
     Database *databases;
     Database *current;
     uint32_t next_db_id;
-    uint32_t block_size;        /* effective block size for this instance */
+    uint32_t block_size;   /* default block size for newly created databases */
 
-    ParamStore globals;         /* instance-wide (global) parameters */
+    ParamStore globals;    /* instance-wide (global) parameters */
 
-    Pager *pager;               /* NULL for a memory-only instance */
-    uint32_t catalog_start;     /* physical block where the catalog begins */
-    uint32_t catalog_nblocks;   /* catalog length in blocks */
-    uint32_t catalog_capacity;  /* blocks reserved for the catalog run */
+    char *base_path;       /* e.g. $MYMY/mymydb or $HOME/mymydb */
+    char *data_dir;        /* base_path + "/data" */
 } Instance;
 
-/* Memory-only instance (default block size) with a default 'main' database. */
-Instance *db_new(void);
-/* Memory-only instance with a given block size. */
-Instance *instance_new_bs(uint32_t block_size);
-/* File-backed instance: reloads path if it exists, otherwise creates it with
- * the given block size (the size is ignored when reloading an existing file). */
-Instance *instance_open(const char *path, uint32_t block_size);
-/* Checkpoints (if file-backed) and frees everything. */
+/* Opens (creating if absent) an instance rooted at base_path. block_size is the
+ * default for new databases; existing database files keep their stored size.
+ * Returns NULL on I/O error. */
+Instance *instance_open(const char *base_path, uint32_t block_size);
+
+/* Checkpoints all databases + the master, then frees everything. */
 void db_free(Instance *inst);
 
 Database *instance_current(Instance *inst);
 Database *instance_find_db(Instance *inst, const char *name);
-/* Creates a database (seeded with the global params as defaults); returns NULL
- * if one with that name already exists. */
+/* Creates a database (its own file, params seeded from the globals); returns
+ * NULL if one with that name already exists. */
 Database *instance_create_db(Instance *inst, const char *name);
 /* Selects the current database; returns false if not found. */
 bool instance_use(Instance *inst, const char *name);
 
-/* Flushes dirty blocks, catalog, and superblock to disk (no-op in memory). */
+/* Flushes every database's dirty blocks/catalog and the master registry. */
 void instance_checkpoint(Instance *inst);
 
 #endif /* MYMYDB_INSTANCE_H */

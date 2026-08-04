@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct {
     int checks;
@@ -19,13 +20,30 @@ typedef struct {
 
 extern TestStats T;
 
-#define RUN(fn) do {                     \
-    T.cur = #fn;                         \
-    int before = T.failed;               \
-    fn();                                \
-    printf("  %-28s %s\n", #fn,          \
-           T.failed == before ? "ok" : "FAIL"); \
+/* Runs one test, printing its pass/fail and wall-clock time (v2.2). */
+#define RUN(fn) do {                                             \
+    T.cur = #fn;                                                 \
+    int before = T.failed;                                       \
+    struct timespec _t0, _t1;                                    \
+    clock_gettime(CLOCK_MONOTONIC, &_t0);                        \
+    fn();                                                        \
+    clock_gettime(CLOCK_MONOTONIC, &_t1);                        \
+    double _ms = (_t1.tv_sec - _t0.tv_sec) * 1e3 +               \
+                 (_t1.tv_nsec - _t0.tv_nsec) / 1e6;              \
+    printf("  %-28s %-4s %9.2f ms\n", #fn,                       \
+           T.failed == before ? "ok" : "FAIL", _ms);             \
 } while (0)
+
+/*
+ * v2.2 removed the in-memory mode, so a test instance is rooted at a fresh
+ * temporary base directory. db_new() wipes and reopens it; the on-exit
+ * checkpoint from db_free writes into build/testdata (gitignored).
+ */
+#define TEST_BASE "build/testdata"
+static inline Instance *db_new(void) {
+    if (system("rm -rf " TEST_BASE) != 0) { /* ignore */ }
+    return instance_open(TEST_BASE, DEFAULT_BLOCK_SIZE);
+}
 
 #define CHECK(cond) do {                                       \
     T.checks++;                                                \

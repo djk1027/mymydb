@@ -51,7 +51,12 @@ int main(int argc, char **argv) {
     printf("  %-26s %14s %11s %16s %12s\n",
            "workload", "rows", "time", "throughput", "latency");
 
-    Instance *db = db_new();
+    /* v2.2: no in-memory mode — run against a throwaway base directory. Blocks
+     * are buffered in memory and only flushed at db_free, so the insert loop
+     * still measures the engine, not per-row disk I/O. */
+    if (system("rm -rf build/benchbase") != 0) { /* ignore */ }
+    Instance *db = instance_open("build/benchbase", DEFAULT_BLOCK_SIZE);
+    if (!db) { fprintf(stderr, "cannot open bench instance\n"); return 1; }
     must_exec(db, "CREATE TABLE b (id INT, label TEXT)", sink);
 
     /* --- 1. INSERT throughput (end-to-end: parse + execute) --- */

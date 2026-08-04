@@ -1,6 +1,7 @@
 #include "test_util.h"
 
 #include <inttypes.h>
+#include <unistd.h>
 
 TestStats T = {0};
 
@@ -332,12 +333,12 @@ static void test_databases(void) {
 static void test_persistence(void) {
     char err[256];
     char *out = NULL;
-    const char *path = "build/test_persist.db";
-    remove(path);
+    const char *base = "build/persistbase";
+    if (system("rm -rf build/persistbase") != 0) { /* ignore */ }
 
     /* session 1: populate a file-backed instance, then close (checkpoints) */
     {
-        Instance *db = instance_open(path, DEFAULT_BLOCK_SIZE);
+        Instance *db = instance_open(base, DEFAULT_BLOCK_SIZE);
         CHECK(db != NULL);
         CHECK(db_exec(db, "CREATE DATABASE app", NULL, err, sizeof err));
         CHECK(db_exec(db, "USE app", NULL, err, sizeof err));
@@ -351,9 +352,9 @@ static void test_persistence(void) {
         db_free(db);
     }
 
-    /* session 2: reopen the same file and verify everything survived */
+    /* session 2: reopen the same base and verify everything survived */
     {
-        Instance *db = instance_open(path, DEFAULT_BLOCK_SIZE);
+        Instance *db = instance_open(base, DEFAULT_BLOCK_SIZE);
         CHECK(db != NULL);
         CHECK(db_exec(db, "USE app", NULL, err, sizeof err));
 
@@ -376,7 +377,7 @@ static void test_persistence(void) {
 
     /* session 3: confirm the post-reload insert also persisted */
     {
-        Instance *db = instance_open(path, DEFAULT_BLOCK_SIZE);
+        Instance *db = instance_open(base, DEFAULT_BLOCK_SIZE);
         CHECK(db_exec(db, "USE app", NULL, err, sizeof err));
         CHECK(db_exec(db, "SELECT COUNT(*) FROM u", &out, err, sizeof err));
         CHECK(contains(out, "300"));
@@ -384,7 +385,7 @@ static void test_persistence(void) {
         db_free(db);
     }
 
-    remove(path);
+    if (system("rm -rf build/persistbase") != 0) { /* ignore */ }
 }
 
 /* ---- SHOW / parameters (v2.1) ------------------------------------------- */
@@ -413,7 +414,7 @@ static void test_show_and_params(void) {
     CHECK(db_exec(db, "SHOW GLOBAL PARAMETERS", &out, err, sizeof err));
     CHECK(contains(out, "block_size"));
     CHECK(contains(out, "8192"));
-    CHECK(contains(out, "data_file"));
+    CHECK(contains(out, "base_path"));
     free(out);
 
     /* per-db params are seeded from the global defaults on db creation */
@@ -454,20 +455,242 @@ static void test_show_and_params(void) {
     CHECK(contains(out, "SHOW"));
     free(out);
 
+    /* explicit CHECKPOINT succeeds */
+    CHECK(db_exec(db, "CHECKPOINT", &out, err, sizeof err));
+    CHECK(contains(out, "checkpoint"));
+    free(out);
+
     db_free(db);
 }
+
+/* ---- per-database files (v2.2) ------------------------------------------ */
+
+static void test_perdb_files(void) {
+    char err[256];
+    const char *base = "build/perdbbase";
+    if (system("rm -rf build/perdbbase") != 0) { /* ignore */ }
+
+    {
+        Instance *db = instance_open(base, DEFAULT_BLOCK_SIZE);
+        db_exec(db, "CREATE DATABASE sales", NULL, err, sizeof err);
+        db_exec(db, "CREATE DATABASE hr", NULL, err, sizeof err);
+        db_exec(db, "USE sales", NULL, err, sizeof err);
+        db_exec(db, "CREATE TABLE t (a INT)", NULL, err, sizeof err);
+        db_exec(db, "INSERT INTO t VALUES (1)", NULL, err, sizeof err);
+        db_free(db);
+    }
+
+    /* each database has its own file under data/, plus the master registry */
+    CHECK(access("build/perdbbase/data/_master", F_OK) == 0);
+    CHECK(access("build/perdbbase/data/main.mdb", F_OK) == 0);
+    CHECK(access("build/perdbbase/data/sales.mdb", F_OK) == 0);
+    CHECK(access("build/perdbbase/data/hr.mdb", F_OK) == 0);
+
+    /* the registry + per-db data reload together */
+    {
+        char *out = NULL;
+        Instance *db = instance_open(base, DEFAULT_BLOCK_SIZE);
+        CHECK(db_exec(db, "SHOW DATABASES", &out, err, sizeof err));
+        CHECK(contains(out, "sales"));
+        CHECK(contains(out, "hr"));
+        free(out);
+        CHECK(db_exec(db, "USE sales", NULL, err, sizeof err));
+        CHECK(db_exec(db, "SELECT COUNT(*) FROM t", &out, err, sizeof err));
+        CHECK(contains(out, "1"));
+        free(out);
+        db_free(db);
+    }
+
+    if (system("rm -rf build/perdbbase") != 0) { /* ignore */ }
+}
+
+/* ---- UPDATE (v2.3) ------------------------------------------------------ */
+
+static void test_update(void) {
+    Instance *db = db_new();
+    char err[256];
+    char *out = NULL;
+
+    db_exec(db, "CREATE TABLE t (id INT, name TEXT, n INT)", NULL, err, sizeof err);
+    for (int i = 1; i <= 5; i++) {
+        char sql[64];
+        snprintf(sql, sizeof sql, "INSERT INTO t VALUES (%d, 'r%d', %d)", i, i, i * 10);
+        db_exec(db, sql, NULL, err, sizeof err);
+    }
+
+    /* single-row, multi-column update */
+    CHECK(db_exec(db, "UPDATE t SET name = 'X', n = 999 WHERE id = 3",
+                  &out, err, sizeof err));
+    CHECK(contains(out, "1 row updated"));
+    free(out);
+    CHECK(db_exec(db, "SELECT name, n FROM t WHERE id = 3", &out, err, sizeof err));
+    CHECK(contains(out, "X"));
+    CHECK(contains(out, "999"));
+    free(out);
+
+    /* multi-row update via range */
+    CHECK(db_exec(db, "UPDATE t SET n = 0 WHERE id >= 4", &out, err, sizeof err));
+    CHECK(contains(out, "2 rows updated"));
+    free(out);
+    CHECK(db_exec(db, "SELECT COUNT(*) FROM t WHERE n = 0", &out, err, sizeof err));
+    CHECK(contains(out, "2"));
+    free(out);
+
+    /* rows not matched are untouched; row count is stable */
+    CHECK(db_exec(db, "SELECT COUNT(*) FROM t", &out, err, sizeof err));
+    CHECK(contains(out, "5"));
+    free(out);
+
+    /* errors */
+    CHECK(!db_exec(db, "UPDATE nope SET a = 1", NULL, err, sizeof err));
+    CHECK(contains(err, "no such table"));
+    CHECK(!db_exec(db, "UPDATE t SET zzz = 1 WHERE id = 1", NULL, err, sizeof err));
+    CHECK(contains(err, "unknown column"));
+
+    db_free(db);
+}
+
+/* ---- B+tree indexes (v2.3) ---------------------------------------------- */
+
+static void test_indexes(void) {
+    Instance *db = db_new();
+    char err[256];
+    char *out = NULL;
+
+    db_exec(db, "CREATE TABLE t (id INT, grp TEXT, v INT)", NULL, err, sizeof err);
+    /* enough rows to force B+tree node splits */
+    for (int i = 0; i < 2000; i++) {
+        char sql[96];
+        snprintf(sql, sizeof sql, "INSERT INTO t VALUES (%d, 'g%d', %d)",
+                 i, i % 10, i * 2);
+        db_exec(db, sql, NULL, err, sizeof err);
+    }
+    CHECK(db_exec(db, "CREATE INDEX idx_id ON t (id)", NULL, err, sizeof err));
+    CHECK(db_exec(db, "CREATE INDEX idx_grp ON t (grp)", NULL, err, sizeof err));
+
+    /* point lookup via index returns the right row */
+    CHECK(db_exec(db, "SELECT v FROM t WHERE id = 1234", &out, err, sizeof err));
+    CHECK(contains(out, "2468"));
+    CHECK(contains(out, "(1 row)"));
+    free(out);
+
+    /* range scan */
+    CHECK(db_exec(db, "SELECT COUNT(*) FROM t WHERE id >= 1990", &out, err, sizeof err));
+    CHECK(contains(out, "10"));
+    free(out);
+    CHECK(db_exec(db, "SELECT COUNT(*) FROM t WHERE id <= 4", &out, err, sizeof err));
+    CHECK(contains(out, "5"));
+    free(out);
+
+    /* text index equality (200 rows share each group) */
+    CHECK(db_exec(db, "SELECT COUNT(*) FROM t WHERE grp = 'g7'", &out, err, sizeof err));
+    CHECK(contains(out, "200"));
+    free(out);
+
+    /* covering query: only the indexed column is projected/filtered */
+    CHECK(db_exec(db, "SELECT id FROM t WHERE id = 777", &out, err, sizeof err));
+    CHECK(contains(out, "777"));
+    CHECK(contains(out, "(1 row)"));
+    free(out);
+
+    /* index stays correct across INSERT / UPDATE / DELETE */
+    CHECK(db_exec(db, "INSERT INTO t VALUES (99999, 'gx', 7)", NULL, err, sizeof err));
+    CHECK(db_exec(db, "SELECT v FROM t WHERE id = 99999", &out, err, sizeof err));
+    CHECK(contains(out, "7")); free(out);
+
+    CHECK(db_exec(db, "UPDATE t SET id = 88888 WHERE id = 99999", NULL, err, sizeof err));
+    CHECK(db_exec(db, "SELECT COUNT(*) FROM t WHERE id = 99999", &out, err, sizeof err));
+    CHECK(contains(out, "(1 row)")); /* aggregate always yields one row */
+    CHECK(contains(out, "0"));
+    free(out);
+    CHECK(db_exec(db, "SELECT v FROM t WHERE id = 88888", &out, err, sizeof err));
+    CHECK(contains(out, "7")); free(out);
+
+    CHECK(db_exec(db, "DELETE FROM t WHERE id = 88888", NULL, err, sizeof err));
+    CHECK(db_exec(db, "SELECT COUNT(*) FROM t WHERE id = 88888", &out, err, sizeof err));
+    CHECK(contains(out, "0")); free(out);
+
+    /* DROP INDEX, then the same query still works (via full scan) */
+    CHECK(db_exec(db, "DROP INDEX idx_id", NULL, err, sizeof err));
+    CHECK(db_exec(db, "SELECT v FROM t WHERE id = 1234", &out, err, sizeof err));
+    CHECK(contains(out, "2468")); free(out);
+    CHECK(!db_exec(db, "DROP INDEX idx_id", NULL, err, sizeof err));
+    CHECK(contains(err, "no such index"));
+
+    db_free(db);
+}
+
+/* ---- performance: full scan vs index scan (v2.3) ------------------------ */
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+static void perf_run(int N, int reps) {
+    Instance *db = db_new();
+    char err[256];
+    char *out = NULL;
+    FILE *sink = fopen("/dev/null", "w");
+
+    db_exec(db, "CREATE TABLE t (id INT, v INT)", NULL, err, sizeof err);
+    for (int i = 0; i < N; i++) { /* fast path: parse+execute, discard output */
+        char sql[64];
+        snprintf(sql, sizeof sql, "INSERT INTO t VALUES (%d, %d)", i, i * 2);
+        Stmt *s = parse_statement(sql, err, sizeof err);
+        execute(db, s, sink, err, sizeof err);
+        stmt_free(s);
+    }
+
+    int target = N - 1;
+    char q[64];
+    snprintf(q, sizeof q, "SELECT v FROM t WHERE id = %d", target);
+    char expect[32];
+    snprintf(expect, sizeof expect, "%d", target * 2);
+
+    /* full scan (no index yet) */
+    double t0 = now_ms();
+    for (int r = 0; r < reps; r++) {
+        CHECK(db_exec(db, q, &out, err, sizeof err));
+        CHECK(contains(out, expect));
+        free(out);
+    }
+    double full_ms = now_ms() - t0;
+
+    db_exec(db, "CREATE INDEX idx_id ON t (id)", NULL, err, sizeof err);
+
+    /* same query, now index-driven */
+    t0 = now_ms();
+    for (int r = 0; r < reps; r++) {
+        CHECK(db_exec(db, q, &out, err, sizeof err));
+        CHECK(contains(out, expect));
+        free(out);
+    }
+    double idx_ms = now_ms() - t0;
+
+    printf("    [N=%d, %d reps] full-scan %8.2f ms   index %8.2f ms   speedup %.0fx\n",
+           N, reps, full_ms, idx_ms, idx_ms > 0 ? full_ms / idx_ms : 0);
+    CHECK(idx_ms < full_ms); /* index must beat a full scan at this scale */
+
+    fclose(sink);
+    db_free(db);
+}
+
+static void test_perf_100k(void) { perf_run(100000, 50); }
+static void test_perf_1m(void)   { perf_run(1000000, 20); }
 
 /* ---- runtime block size + persistence (v2.1) ---------------------------- */
 
 static void test_block_size_persist(void) {
     char err[256];
     char *out = NULL;
-    const char *path = "build/test_bs.db";
-    remove(path);
+    const char *base = "build/bsbase";
+    if (system("rm -rf build/bsbase") != 0) { /* ignore */ }
 
-    /* create a file with a non-default 512-byte block size */
+    /* create a database whose file uses a non-default 512-byte block size */
     {
-        Instance *db = instance_open(path, 512);
+        Instance *db = instance_open(base, 512);
         CHECK(db != NULL);
         db_exec(db, "CREATE TABLE t (id INT, s TEXT)", NULL, err, sizeof err);
         bool ok = true;
@@ -482,7 +705,7 @@ static void test_block_size_persist(void) {
 
     /* reopen requesting a different size: the file's stored 512 must win */
     {
-        Instance *db = instance_open(path, 16384);
+        Instance *db = instance_open(base, 16384);
         CHECK(db != NULL);
         CHECK(db_exec(db, "SHOW GLOBAL PARAMETERS", &out, err, sizeof err));
         CHECK(contains(out, "512"));
@@ -498,7 +721,7 @@ static void test_block_size_persist(void) {
         db_free(db);
     }
 
-    remove(path);
+    if (system("rm -rf build/bsbase") != 0) { /* ignore */ }
 }
 
 /* ---- error handling ----------------------------------------------------- */
@@ -664,6 +887,11 @@ int main(void) {
     RUN(test_persistence);
     RUN(test_show_and_params);
     RUN(test_block_size_persist);
+    RUN(test_perdb_files);
+    RUN(test_update);
+    RUN(test_indexes);
+    RUN(test_perf_100k);
+    RUN(test_perf_1m);
     RUN(test_errors);
     RUN(test_overflow);
     RUN(test_string_escape);
